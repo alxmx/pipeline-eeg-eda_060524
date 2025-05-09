@@ -1,0 +1,1 @@
+2025-05-08 21:09:05,732 - WARNING - Did not find any electrode locations (in the info object), will attempt to use digitization points instead. However, if digitization points do not correspond to the EEG electrodes, this will lead to bad results. Please verify that the sensor locations in the plot are accurate.
