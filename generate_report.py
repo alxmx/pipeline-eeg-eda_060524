@@ -6,11 +6,6 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 from joblib import load
-from fpdf import FPDF
-from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
-from joblib import load
 
 class AnalysisReport(FPDF):
     def header(self):
@@ -41,8 +36,7 @@ def create_analysis_table():
         ],            'EEG': [
             '250 Hz',
             '1 second (250 samples)',
-            '96% (240/250 samples)',
-            'Notch Filter (50 Hz, Butterworth)\nBandpass Filter (0.5–40 Hz, 4th order Butterworth)',
+            '96% (240/250 samples)',            'Notch Filter (50 Hz, Butterworth)\nBandpass Filter (0.5-40 Hz, 4th order Butterworth)',
             'Delta (0.5-4 Hz), Theta (4-8 Hz), Alpha (8-13 Hz), Beta (13-30 Hz), Gamma (30-40 Hz)',
             'Time: Mean, SD, Max, Min, IQR\nFreq: Band powers, ratios, spectral entropy, flatness',
             'Welch\'s PSD (nperseg=250), Periodogram with high overlap, Spectral edge frequency, coherence',
