@@ -9,7 +9,71 @@ This script implements advanced signal processing for EEG data analysis, includi
 - Band power calculations
 - Advanced visualization
 """
+"""
+Electrode Key:
 
+    Frontal: Fz (ch1)
+    Left Central: C3 (ch2)
+    Central Midline: Cz (ch3)
+    Right Central: C4 (ch4)
+    Parietal Midline: Pz (ch5)
+    Left Parietal-Occipital: PO7 (ch6)
+    Occipital: Oz (ch7)
+    Right Parietal-Occipital: PO8 (ch8)
+    Accelerometers (ch9–11): Not relevant for EEG analysis.
+
+1. Excited (High Arousal, High Valence)
+
+    EEG: ↑ Beta (frontal/central), ↓ Alpha (posterior)
+    Electrodes:
+        ↑ Beta: Fz (ch1) (frontal midline), C3 (ch2), Cz (ch3), C4 (ch4) (central regions).
+            Why: Beta reflects active engagement; frontal/central regions drive alertness and motor planning.
+        ↓ Alpha: PO7 (ch6), Oz (ch7), PO8 (ch8) (posterior).
+            Why: Alpha decreases in posterior areas when relaxed focus is disrupted by excitement.
+
+2. Angry (High Arousal, Low Valence)
+
+    EEG: ↑ Right Frontal Beta
+    Electrodes:
+        ↑ Beta: C4 (ch4) (right central).
+            Why: The right central region (C4) approximates right frontal activity due to proximity and shared motor/emotional networks. Beta here aligns with "fight response" motor tension.
+        Also possible: Fz (ch1) (midline frontal Beta due to generalized arousal).
+
+3. Sad (Low Arousal, Low Valence)
+
+    EEG: ↑ Right Alpha (posterior)
+    Electrodes:
+        ↑ Alpha: PO8 (ch8) (right parietal-occipital).
+            Why: Posterior Alpha peaks during passive states. Right hemisphere dominance (PO8) links to withdrawal emotions like sadness.
+
+4. Calm (Low Arousal, High Valence)
+
+    EEG: ↑ Left Alpha (posterior)
+    Electrodes:
+        ↑ Alpha: PO7 (ch6) (left parietal-occipital).
+            Why: Left posterior Alpha (PO7) reflects relaxed, positive states. The left hemisphere (PO7) biases toward approach/positivity, even at rest.
+
+Summary Table:
+Emotion	Arousal/Valence	EEG Pattern	Relevant Electrodes
+Excited	High, High	↑ Beta, ↓ Alpha	Fz, C3, Cz, C4; PO7, Oz, PO8
+Angry	High, Low	↑ Right Beta	C4 (right central)
+Sad	Low, Low	↑ Right Alpha (posterior)	PO8 (right parietal-occipital)
+Calm	Low, High	↑ Left Alpha (posterior)	PO7 (left parietal-occipital)
+Key Notes:
+
+    Frontal vs. Central:
+        The absence of lateral frontal electrodes (e.g., F3/F4) means nearby central electrodes (C3/C4) may proxy for frontal activity due to overlapping networks.
+        Fz (midline) captures generalized frontal arousal.
+
+    Posterior Dominance for Alpha:
+        Alpha is strongest in posterior regions (PO7/PO8, Oz), so parietal-occipital electrodes best reflect Alpha changes linked to low arousal.
+
+    Hemispheric Asymmetry:
+        Left hemisphere positivity → C3 (central) and PO7 (posterior).
+        Right hemisphere negativity → C4 (central) and PO8 (posterior).
+
+
+"""
 # === USAGE INSTRUCTIONS ===
 # To run the EEG analysis with the added plots and features:
 # 1. Place your EEG CSV files in the 'data/eeg' directory.
@@ -90,6 +154,43 @@ channel_labels = [
 
 # Constants
 NUM_CHANNELS = 8  # First 8 EEG channels
+
+# Configuration for electrode mapping and emotion detection
+ELECTRODES = {
+    'Fz': 0,    # Frontal midline
+    'C3': 1,    # Left central
+    'Cz': 2,    # Central midline
+    'C4': 3,    # Right central
+    'Pz': 4,    # Parietal midline
+    'PO7': 5,   # Left parietal-occipital
+    'Oz': 6,    # Occipital midline
+    'PO8': 7    # Right parietal-occipital
+}
+
+EMOTION_CHANNELS = {
+    'excited': ['Fz', 'C3', 'Cz', 'C4'],  # Beta up, Alpha down
+    'angry': ['C4'],                       # Right frontal beta up
+    'sad': ['PO8'],                        # Right alpha up
+    'calm': ['PO7']                        # Left alpha up
+}
+
+EMOTION_THRESHOLDS = {
+    'beta_high': 5.0,        # µV²/Hz for excited state
+    'beta_asymmetry': 2.0,   # Ratio for angry state
+    'alpha_low': 2.0         # µV²/Hz for sad state
+}
+
+# Window configurations
+WINDOW_CONFIGS = {
+    'short': {
+        'duration': 5.0,     # seconds
+        'overlap': 2.5       # 50% overlap
+    },
+    'long': {
+        'duration': 10.0,    # seconds
+        'overlap': 5.0       # 50% overlap
+    }
+}
 
 def bandpass_filter(data, lowcut, highcut, fs, order=4):
     """Apply a bandpass filter to the signal."""
@@ -897,8 +998,16 @@ def main():
     if not eeg_files:
         print(f"No EEG files found in {input_dir}")
         return
-        
-    baseline_file = eeg_files[1] if len(eeg_files) > 1 else eeg_files[0]  # Use second file as baseline
+    
+    # File mapping for emotional states
+    emotion_files = {
+        'sad': eeg_files[0],      # First file
+        'calm': [eeg_files[1], eeg_files[6]],  # Second and seventh files
+        'angry': eeg_files[7:9],   # Eighth and ninth files
+        'validation': eeg_files[2:7]  # Files 3-7 for validation
+    }
+    
+    baseline_file = emotion_files['calm'][0]  # Use first calm file as baseline
     
     # Dictionary to store all processed data
     all_processed_data = {}
@@ -1145,3 +1254,430 @@ def plot_alpha_asymmetry_over_time(processed_data):
     )
     
     return fig
+
+# Detection and classification functions
+
+def detect_artifacts(acc_data, gyr_data, threshold=0.3):
+    """Detect motion artifacts using accelerometer and gyroscope data.
+    
+    Args:
+        acc_data: Accelerometer data (channels 8-10)
+        gyr_data: Gyroscope data (channels 11-13)
+        threshold: Motion detection threshold
+        
+    Returns:
+        boolean array: True for clean data, False for artifacts
+    """
+    acc_magnitude = np.sqrt(np.sum(acc_data**2, axis=1))
+    gyr_magnitude = np.sqrt(np.sum(gyr_data**2, axis=1))
+    motion_score = acc_magnitude + gyr_magnitude
+    return motion_score <= threshold
+
+def classify_emotional_state(processed_data, window_size='short', thresholds=None):
+    """Classify emotional state using processed EEG features.
+    
+    Args:
+        processed_data: Dictionary containing processed channel data
+        window_size: 'short' (5s) or 'long' (10s)
+        thresholds: Optional auto-quantized thresholds
+        
+    Returns:
+        str: Classified emotion ('excited', 'angry', 'sad', 'calm')
+        dict: Confidence scores for each emotion
+    """
+    # Get window parameters
+    window_params = WINDOW_CONFIGS[window_size]
+    window_samples = int(window_params['duration'] * sampling_rate)
+    
+    # Calculate features for each emotion
+    scores = {
+        'excited': 0.0,
+        'angry': 0.0,
+        'sad': 0.0,
+        'calm': 0.0
+    }
+    
+    # Excited state: high beta, low alpha in frontal/central
+    beta_power = 0
+    alpha_power = 0
+    for ch_name in EMOTION_CHANNELS['excited']:
+        ch_idx = ELECTRODES[ch_name]
+        ch_data = processed_data[ch_idx]
+        beta_power += ch_data['powers']['beta_mid']
+        alpha_power += ch_data['powers']['alpha']
+    excited_score = beta_power / (alpha_power + 1e-6)
+    scores['excited'] = excited_score
+    
+    # Angry state: right frontal beta (C4)
+    ch_idx = ELECTRODES['C4']
+    angry_score = processed_data[ch_idx]['powers']['beta_mid']
+    scores['angry'] = angry_score
+    
+    # Sad state: right posterior alpha (PO8)
+    ch_idx = ELECTRODES['PO8']
+    sad_score = processed_data[ch_idx]['powers']['alpha']
+    scores['sad'] = sad_score
+    
+    # Calm state: left posterior alpha (PO7)
+    ch_idx = ELECTRODES['PO7']
+    calm_score = processed_data[ch_idx]['powers']['alpha']
+    scores['calm'] = calm_score
+    
+    # Normalize scores
+    total = sum(scores.values()) + 1e-6
+    scores = {k: v/total for k, v in scores.items()}
+    
+    # Classify based on highest score
+    emotion = max(scores.items(), key=lambda x: x[1])[0]
+    
+    return emotion, scores
+
+def create_emotion_visualization(processed_data, window_size='short'):
+    """Create interactive visualization of emotional state classification.
+    
+    Args:
+        processed_data: Dictionary of processed EEG data
+        window_size: 'short' (5s) or 'long' (10s)
+    """
+    window_params = WINDOW_CONFIGS[window_size]
+    
+    # Create figure with subplots
+    fig = make_subplots(
+        rows=4, cols=2,
+        subplot_titles=(
+            'Beta Power (Frontal/Central)',
+            'Emotional State Probability',
+            'Alpha Asymmetry (PO7-PO8)',
+            'Beta Asymmetry (C3-C4)',
+            'Time-varying Band Powers',
+            'Motion Artifacts',
+            'Valence-Arousal Space',
+            'State Transitions'
+        ),
+        specs=[
+            [{"type": "scatter"}, {"type": "bar"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+            [{"type": "scatter", "colspan": 2}, None]
+        ]
+    )
+    
+    # Get time points
+    times = processed_data[0]['buffer_data']['times']
+    
+    # 1. Beta Power in Frontal/Central channels
+    for ch_name in ['Fz', 'C3', 'Cz', 'C4']:
+        ch_idx = ELECTRODES[ch_name]
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=processed_data[ch_idx]['buffer_data']['powers']['beta_mid'],
+                name=f'Beta {ch_name}',
+                mode='lines'
+            ),
+            row=1, col=1
+        )
+    
+    # 2. Emotion Probabilities
+    emotions = []
+    probabilities = []
+    for t_idx in range(len(times)):
+        # Get data window centered at current time
+        emotion, scores = classify_emotional_state(
+            {ch: {'powers': {
+                band: powers[t_idx] 
+                for band, powers in ch_data['buffer_data']['powers'].items()
+            }} for ch, ch_data in processed_data.items()}
+        )
+        emotions.append(emotion)
+        probabilities.append(scores)
+    
+    # Plot emotion probabilities
+    for emotion in ['excited', 'angry', 'sad', 'calm']:
+        fig.add_trace(
+            go.Bar(
+                name=emotion.capitalize(),
+                x=[emotion],
+                y=[np.mean([p[emotion] for p in probabilities])]
+            ),
+            row=1, col=2
+        )
+    
+    # 3. Alpha Asymmetry
+    left_alpha = processed_data[ELECTRODES['PO7']]['buffer_data']['powers']['alpha']
+    right_alpha = processed_data[ELECTRODES['PO8']]['buffer_data']['powers']['alpha']
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=np.log(right_alpha) - np.log(left_alpha),
+            name='Alpha Asymmetry'
+        ),
+        row=2, col=1
+    )
+    
+    # 4. Beta Asymmetry
+    left_beta = processed_data[ELECTRODES['C3']]['buffer_data']['powers']['beta_mid']
+    right_beta = processed_data[ELECTRODES['C4']]['buffer_data']['powers']['beta_mid']
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=np.log(right_beta) - np.log(left_beta),
+            name='Beta Asymmetry'
+        ),
+        row=2, col=2
+    )
+    
+    # 5. Time-varying Band Powers
+    for band in FREQ_BANDS:
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=np.mean([ch_data['buffer_data']['powers'][band] 
+                          for ch_data in processed_data.values()], axis=0),
+                name=f'{band} Power'
+            ),
+            row=3, col=1
+        )
+    
+    # 6. Motion Artifacts
+    acc_data = processed_data[8:11]['raw']  # Channels 9-11
+    gyr_data = processed_data[11:14]['raw']  # Channels 12-14
+    artifacts = detect_artifacts(acc_data, gyr_data)
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=artifacts.astype(int),
+            name='Clean Signal',
+            mode='lines'
+        ),
+        row=3, col=2
+    )
+    
+    # 7. Emotion State Transitions
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=emotions,
+            name='Emotional State',
+            mode='lines+markers'
+        ),
+        row=4, col=1
+    )
+    
+    # Update layout
+    fig.update_layout(
+        height=1200,
+        showlegend=True,
+        title_text=f"Emotional State Analysis (Window: {window_params['duration']}s)"
+    )
+    
+    return fig
+
+def calculate_auto_quantization_thresholds(all_processed_data, emotion_files):
+    """Calculate automatic quantization thresholds from baseline data.
+    
+    Args:
+        all_processed_data (dict): Processed data from all files
+        emotion_files (dict): Mapping of emotion labels to filenames
+        
+    Returns:
+        dict: Quantization thresholds for each feature and emotion
+    """
+    # Initialize storage for feature distributions
+    feature_stats = {
+        'beta_frontal': [],    # Frontal beta (Fz, C3, Cz, C4)
+        'alpha_left': [],      # Left alpha (PO7)
+        'alpha_right': [],     # Right alpha (PO8)
+        'beta_right': [],      # Right beta (C4)
+        'alpha_total': [],     # Total alpha (PO7, Oz, PO8)
+        'beta_total': []       # Total beta (all channels)
+    }
+    
+    # Collect features across all files
+    for file_name, file_data in all_processed_data.items():
+        # Beta frontal
+        beta_frontal = np.mean([
+            file_data[ELECTRODES[ch]]['powers']['beta_mid']
+            for ch in ['Fz', 'C3', 'Cz', 'C4']
+        ])
+        feature_stats['beta_frontal'].append(beta_frontal)
+        
+        # Alpha left/right
+        feature_stats['alpha_left'].append(
+            file_data[ELECTRODES['PO7']]['powers']['alpha']
+        )
+        feature_stats['alpha_right'].append(
+            file_data[ELECTRODES['PO8']]['powers']['alpha']
+        )
+        
+        # Right beta (C4)
+        feature_stats['beta_right'].append(
+            file_data[ELECTRODES['C4']]['powers']['beta_mid']
+        )
+        
+        # Total alpha/beta
+        feature_stats['alpha_total'].append(np.mean([
+            file_data[ELECTRODES[ch]]['powers']['alpha']
+            for ch in ['PO7', 'Oz', 'PO8']
+        ]))
+        feature_stats['beta_total'].append(np.mean([
+            file_data[ch]['powers']['beta_mid']
+            for ch in range(NUM_CHANNELS)
+        ]))
+    
+    # Calculate statistics
+    stats = {}
+    for feature, values in feature_stats.items():
+        values = np.array(values)
+        stats[feature] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'q25': np.percentile(values, 25),
+            'q50': np.percentile(values, 50),
+            'q75': np.percentile(values, 75)
+        }
+    
+    # Calculate emotion-specific thresholds
+    thresholds = {
+        'excited': {
+            'beta_high': stats['beta_total']['q75'],
+            'alpha_low': stats['alpha_total']['q25']
+        },
+        'angry': {
+            'beta_right_high': stats['beta_right']['q75'],
+            'beta_asymmetry': stats['beta_right']['q75'] - stats['beta_frontal']['q50']
+        },
+        'sad': {
+            'alpha_right_high': stats['alpha_right']['q75'],
+            'arousal_low': stats['beta_total']['q25']
+        },
+        'calm': {
+            'alpha_left_high': stats['alpha_left']['q75'],
+            'beta_low': stats['beta_total']['q25']
+        }
+    }
+    
+    return thresholds
+
+def apply_emotion_thresholds(features, thresholds):
+    """Apply auto-quantized thresholds to classify emotional state.
+    
+    Args:
+        features (dict): Extracted EEG features
+        thresholds (dict): Auto-quantized thresholds
+        
+    Returns:
+        tuple: (emotion, confidence_scores)
+    """
+    scores = {
+        'excited': 0.0,
+        'angry': 0.0,
+        'sad': 0.0,
+        'calm': 0.0
+    }
+    
+    # Excited: High beta, low alpha
+    if features['beta_total'] > thresholds['excited']['beta_high']:
+        scores['excited'] += 0.5
+    if features['alpha_total'] < thresholds['excited']['alpha_low']:
+        scores['excited'] += 0.5
+        
+    # Angry: High right beta, beta asymmetry
+    if features['beta_right'] > thresholds['angry']['beta_right_high']:
+        scores['angry'] += 0.6
+    if features['beta_asymmetry'] > thresholds['angry']['beta_asymmetry']:
+        scores['angry'] += 0.4
+        
+    # Sad: High right alpha, low arousal
+    if features['alpha_right'] > thresholds['sad']['alpha_right_high']:
+        scores['sad'] += 0.7
+    if features['beta_total'] < thresholds['sad']['arousal_low']:
+        scores['sad'] += 0.3
+        
+    # Calm: High left alpha, low beta
+    if features['alpha_left'] > thresholds['calm']['alpha_left_high']:
+        scores['calm'] += 0.6
+    if features['beta_total'] < thresholds['calm']['beta_low']:
+        scores['calm'] += 0.4
+    
+    # Normalize scores
+    total = sum(scores.values()) + 1e-6
+    scores = {k: v/total for k, v in scores.items()}
+    
+    # Get highest scoring emotion
+    emotion = max(scores.items(), key=lambda x: x[1])[0]
+    
+    return emotion, scores
+
+def detect_sample_boundaries(data, fs, expected_duration=200):
+    """Detect start and end points of the actual response in a sample.
+    
+    Args:
+        data: Raw EEG data
+        fs: Sampling frequency
+        expected_duration: Expected duration in seconds (default 200s = 3:20)
+        
+    Returns:
+        tuple: (start_idx, end_idx, confidence_score)
+    """
+    # Convert data to energy envelope
+    window_size = int(0.5 * fs)  # 500ms window
+    energy = np.convolve(data**2, np.ones(window_size)/window_size, mode='valid')
+    
+    # Find baseline noise level
+    noise_level = np.percentile(energy, 10)
+    
+    # Find signal onset (when energy exceeds 2x noise level)
+    onset_candidates = np.where(energy > 2 * noise_level)[0]
+    if len(onset_candidates) == 0:
+        return 0, len(data), 0.0
+    
+    start_idx = onset_candidates[0]
+    expected_samples = int(expected_duration * fs)
+    end_idx = min(start_idx + expected_samples, len(data))
+    
+    # Calculate confidence score based on signal-to-noise ratio
+    signal_level = np.mean(energy[start_idx:end_idx])
+    confidence = 1.0 - (noise_level / signal_level)
+    
+    return start_idx, end_idx, confidence
+
+def normalize_sample_timing(processed_data, fs, target_duration=200):
+    """Normalize sample timing to match target duration.
+    
+    Args:
+        processed_data: Dictionary of processed channel data
+        fs: Sampling frequency
+        target_duration: Target duration in seconds
+        
+    Returns:
+        dict: Processed data with normalized timing
+    """
+    # Find start/end points across all EEG channels
+    start_points = []
+    end_points = []
+    for ch in range(NUM_CHANNELS):
+        start, end, conf = detect_sample_boundaries(
+            processed_data[ch]['raw'], fs)
+        if conf > 0.5:  # Only use confident detections
+            start_points.append(start)
+            end_points.append(end)
+    
+    # Use median start/end points for robustness
+    start_idx = int(np.median(start_points)) if start_points else 0
+    end_idx = int(np.median(end_points)) if end_points else len(processed_data[0]['raw'])
+    
+    # Store timing information
+    timing_info = {
+        'start_sample': start_idx,
+        'end_sample': end_idx,
+        'start_time': start_idx / fs,
+        'end_time': end_idx / fs,
+        'duration': (end_idx - start_idx) / fs
+    }
+    
+    # Update all channel data
+    for ch in processed_data:
+        processed_data[ch]['timing'] = timing_info
+        
+    return processed_data
