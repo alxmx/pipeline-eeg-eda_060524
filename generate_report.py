@@ -58,6 +58,25 @@ def create_analysis_table():
     }
     return pd.DataFrame(parameters)
 
+def generate_timestamp():
+    """Generate a consistent timestamp for file naming"""
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+def get_timestamped_filename(base_name, extension, timestamp=None):
+    """Generate a timestamped filename.
+    
+    Args:
+        base_name (str): Base name of the file
+        extension (str): File extension (e.g., 'pdf', 'html')
+        timestamp (str, optional): Timestamp to use. If None, generates new timestamp
+        
+    Returns:
+        str: Timestamped filename
+    """
+    if timestamp is None:
+        timestamp = generate_timestamp()
+    return f"{base_name}_{timestamp}.{extension}"
+
 def generate_pdf_report(eeg_data=None, eda_data=None):
     # Create PDF object
     pdf = AnalysisReport()
@@ -136,8 +155,9 @@ def generate_pdf_report(eeg_data=None, eda_data=None):
     # Create output directory if it doesn't exist
     os.makedirs('output', exist_ok=True)
     
-    # Save the report
-    output_path = 'output/analysis_report.pdf'
+    # Save the report    # Generate timestamped filename
+    output_filename = get_timestamped_filename('analysis_report', 'pdf')
+    output_path = os.path.join('output', output_filename)
     pdf.output(output_path)
     print(f"Report generated successfully: {output_path}")
 
