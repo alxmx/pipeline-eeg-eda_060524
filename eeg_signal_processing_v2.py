@@ -77,7 +77,7 @@ Key Notes:
 # === USAGE INSTRUCTIONS ===
 # To run the EEG analysis with the added plots and features:
 # 1. Place your EEG CSV files in the 'data/eeg' directory.
-# 2. Run this script using: python eeg_signal_processing_v2_modified.py
+# 2. Run this script using: python eeg_signal_processing_v2.py
 # 3. Check the 'output/' folder for the generated PDF report.
 # 4. Use the interactive Plotly charts for each EEG file.
 # 5. The PDF includes alpha/beta ratio plots, band power RMS trends, and markers at key timepoints.
@@ -86,6 +86,7 @@ import os
 import sys
 import subprocess
 
+"""
 # Check and install required packages
 required_packages = ['numpy', 'pandas', 'scipy', 'matplotlib', 'plotly', 'mne', 'scikit-learn', 'seaborn', 'pywavelets']
 for package in required_packages:
@@ -93,7 +94,7 @@ for package in required_packages:
         __import__(package)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
+"""
 # Import required libraries
 import numpy as np
 import pandas as pd
@@ -107,11 +108,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import matplotlib.patches as patches
 import datetime
-import pywt  # For wavelet analysis
-from scipy.signal import stft  # For Short-Time Fourier Transform
-from scipy.signal import decimate
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
+from scipy.signal import cwt, morlet2
+from fpdf import FPDF
 
 # --- CONFIGURATION ---
 # Get the current script's directory
@@ -140,7 +138,7 @@ FREQ_BANDS = {
     'theta': (4, 8),
     'alpha': (8, 12),
     'beta_low': (12, 15),
-    'beta_mid': (15, 30),
+    'beta_mid': (15, 24),  # 24 is safely below Nyquist for fs=50Hz
 }
 
 # Channel labels
@@ -194,15 +192,20 @@ WINDOW_CONFIGS = {
 
 def bandpass_filter(data, lowcut, highcut, fs, order=4):
     """Apply a bandpass filter to the signal."""
-    nyq = 0.5 * fs
+    nyq = 0.5 * fs  # Nyquist frequency
     low = lowcut / nyq
     high = highcut / nyq
+    if not (0 < low < 1 and 0 < high < 1):
+        raise ValueError(f"Invalid cutoff frequencies: low={lowcut}, high={highcut}, fs={fs}")
     b, a = signal.butter(order, [low, high], btype='band')
     return signal.filtfilt(b, a, data)
 
 def notch_filter(data, freq, fs, q=30):
     """Apply a notch filter to remove power line noise."""
-    w0 = freq / (fs/2)
+    nyq = 0.5 * fs  # Nyquist frequency
+    w0 = freq / nyq
+    if not (0 < w0 < 1):
+        raise ValueError(f"Invalid notch frequency: freq={freq}, fs={fs}")
     b, a = signal.iirnotch(w0, q)
     return signal.filtfilt(b, a, data)
 
@@ -479,12 +482,12 @@ def compute_stft(data, fs, nperseg=256, noverlap=None):
     f, t, Zxx = stft(data, fs=fs, nperseg=nperseg, noverlap=noverlap)
     return f, t, np.abs(Zxx)
 
-def compute_wavelet(data, fs, wavelet='cmor1.5-1.0'):
+def compute_wavelet(data, fs, wavelet_width=5.0):
     """Compute Wavelet Transform using continuous wavelet transform."""
-    # Use Complex Morlet wavelet (cmor) which is better suited for EEG analysis
+    # Use Morlet wavelet for analysis
     scales = np.arange(1, 128)
-    frequencies = pywt.scale2frequency(wavelet, scales) * fs
-    coef, freqs = pywt.cwt(data, scales, wavelet)
+    frequencies = fs / (scales * wavelet_width)
+    coef = cwt(data, morlet2, scales, w=wavelet_width)
     return frequencies, np.abs(coef)
 
 def calculate_normalized_band_powers(psd, freqs, bands=FREQ_BANDS):
@@ -988,108 +991,82 @@ def downsample_with_antialiasing(data, fs, downsample_factor):
     return downsampled_data, new_fs
 
 def main():
-    input_dir = os.path.join(os.getcwd(), 'data', 'raw', 'eeg')
+    input_dir = os.path.join(os.getcwd(), 'data', 'raw', 'toTest')
     output_dir = os.path.join(os.getcwd(), 'output')
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    eeg_files = sorted([f for f in os.listdir(input_dir) if f.endswith('.csv')])
-    
+    os.makedirs(output_dir, exist_ok=True)
+
+    eeg_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
     if not eeg_files:
         print(f"No EEG files found in {input_dir}")
         return
-    
-    # File mapping for emotional states
-    emotion_files = {
-        'sad': eeg_files[0],      # First file
-        'calm': [eeg_files[1], eeg_files[6]],  # Second and seventh files
-        'angry': eeg_files[7:9],   # Eighth and ninth files
-        'validation': eeg_files[2:7]  # Files 3-7 for validation
-    }
-    
-    baseline_file = emotion_files['calm'][0]  # Use first calm file as baseline
-    
-    # Dictionary to store all processed data
+
     all_processed_data = {}
-    
-    # Split files for ML
-    train_files = eeg_files[:2]
-    test_files = eeg_files[2:7]
-    validation_files = eeg_files[7:]
-    
-    # Process all files
+    emotion_matrix = []
+    valence_arousal_data = []
+
     for eeg_file in eeg_files:
         file_path = os.path.join(input_dir, eeg_file)
-        try:
-            print(f"\nProcessing {eeg_file}...")
-              # Load and preprocess data with anti-aliasing and downsampling
-            raw_data = load_eeg_data(file_path, do_downsample=True)
-            current_fs = sampling_rate / downsample_factor  # Update sampling rate after downsampling
-            file_processed_data = {}
-            
-            for channel in range(NUM_CHANNELS):
-                # Filter data
-                filtered = filter_eeg(raw_data[channel], sampling_rate)
-                
-                # Compute PSD
-                freqs, psd = compute_psd(filtered, sampling_rate)
-                
-                # Calculate normalized band powers
-                band_powers = calculate_normalized_band_powers(psd, freqs)
-                  # Calculate power ratios
-                power_ratios = calculate_bandpower_ratios(band_powers)
-                
-                # Calculate time-varying bandpowers and ratios
-                buffer_times, buffer_powers, buffer_ratios = calculate_bandpower_with_buffer(
-                    filtered, current_fs, buffer_size=2.0, buffer_overlap=0.5
-                )
-                
-                # Store all data for this channel
-                file_processed_data[channel] = {
-                    'raw': raw_data[channel],
-                    'filtered': filtered,
-                    'freqs': freqs,
-                    'psd': psd,
-                    'powers': band_powers,
-                    'power_ratios': power_ratios,
-                    'time': np.arange(len(filtered)) / current_fs,
-                    'buffer_data': {
-                        'times': buffer_times,
-                        'powers': buffer_powers,
-                        'ratios': buffer_ratios
-                    }
-                }
-            
-            all_processed_data[eeg_file] = file_processed_data
-            
-            # Create individual file visualization
-            plot_file = os.path.join(output_dir, f"{os.path.splitext(eeg_file)[0]}_analysis.html")
-            fig = create_interactive_visualization(raw_data, file_processed_data, all_processed_data.get(baseline_file))
-            fig.write_html(plot_file)
-            print(f"Individual analysis plots saved to {plot_file}")
-            
-        except Exception as e:
-            print(f"Error processing {eeg_file}: {str(e)}")
-            continue
-    
-    try:
-        # Calculate normalization stats across all files
-        band_stats = normalize_across_files(all_processed_data)
-        
-        # Create comparative visualizations
-        comp_plot_file = os.path.join(output_dir, "comparative_analysis.html")
-        comp_fig = create_comparative_visualization(all_processed_data, baseline_file, band_stats)
-        comp_fig.write_html(comp_plot_file)
-        print(f"\nComparative analysis plots saved to {comp_plot_file}")
-        
-        # Create alpha asymmetry comparison
-        asym_plot_file = os.path.join(output_dir, "alpha_asymmetry_comparison.html")
-        asym_fig = create_alpha_asymmetry_comparison(all_processed_data)
-        asym_fig.write_html(asym_plot_file)
-        print(f"Alpha asymmetry comparison saved to {asym_plot_file}")
-        
-    except Exception as e:
-        print(f"Error creating comparative visualizations: {str(e)}")
+        print(f"Processing {eeg_file}...")
+        processed_data = process_eeg_data(file_path)
+        all_processed_data[eeg_file] = processed_data
+
+        # Classify emotions and calculate valence-arousal
+        times = processed_data[0]['buffer_data']['times']
+        emotions, probabilities = [], []
+        for t_idx in range(len(times)):
+            emotion, scores = classify_emotional_state(
+                {ch: {'powers': {band: powers[t_idx] for band, powers in ch_data['buffer_data']['powers'].items()}}
+                 for ch, ch_data in processed_data.items()}
+            )
+            emotions.append(emotion)
+            probabilities.append(scores)
+
+        valence, arousal, _ = calculate_valence_arousal(processed_data, sampling_rate)
+        valence_arousal_data.append((valence, arousal))
+
+        # Save emotion probabilities
+        emotion_matrix.append([np.mean([p[emotion] for p in probabilities]) for emotion in ['excited', 'angry', 'sad', 'calm']])
+
+        # Create visualizations
+        smoothed_fig = plot_smoothed_emotional_estimation(processed_data, times, emotions, probabilities)
+        smoothed_fig.write_html(os.path.join(output_dir, f"{eeg_file}_smoothed_emotions.html"))
+
+        va_fig = plot_valence_arousal_space(valence, arousal, times)
+        va_fig.write_html(os.path.join(output_dir, f"{eeg_file}_valence_arousal.html"))
+
+        print(f"Visualizations saved for {eeg_file}")
+
+    # Generate PDF report
+    generate_pdf_report(output_dir, emotion_matrix, eeg_files, valence_arousal_data)
+
+    print("Processing complete.")
+
+def process_and_classify_emotions(input_dir, output_dir):
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # List all files in the input directory
+    eeg_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
+    emotion_matrix = []
+
+    for file_name in eeg_files:
+        file_path = os.path.join(input_dir, file_name)
+        print(f"Processing {file_name}...")
+
+        # Process EEG data
+        processed_data = process_eeg_data(file_path)
+
+        # Classify emotions
+        emotion, scores = classify_emotional_state(processed_data)
+        emotion_matrix.append(scores)
+
+        # Save frequency domain representation
+        save_frequency_domain_representation(processed_data, file_name, output_dir)
+
+    # Save emotion matrix as a heatmap
+    save_emotion_matrix_visualization(emotion_matrix, eeg_files, output_dir)
+
+    print("Processing complete.")
 
 if __name__ == "__main__":
     main()
@@ -1123,31 +1100,38 @@ def calculate_valence_arousal(processed_data, sampling_rate):
     right_channels = [3, 7]  # C4, PO8
     
     # Initialize arrays for results
-    times = []
-    valence_scores = []
-    arousal_scores = []
-    
-    # Get buffer size info from first channel
     ref_channel = processed_data[0]
     buffer_times = ref_channel['buffer_data']['times']
     
     # Calculate metrics for each time window
     for t_idx, _ in enumerate(buffer_times):
-        # Calculate alpha asymmetry for valence
+        # Calculate hemispheric alpha power
         left_alpha = 0
         right_alpha = 0
         total_beta = 0
         total_alpha = 0
         
-        # Calculate hemispheric alpha power
+        # Calculate alpha power for both channels
         for left_ch, right_ch in zip(left_channels, right_channels):
-            left_alpha += processed_data[left_ch]['buffer_data']['powers']['alpha'][t_idx]
-            right_alpha += processed_data[right_ch]['buffer_data']['powers']['alpha'][t_idx]
+            _, left_psd = compute_psd(processed_data[left_ch]['filtered'], sampling_rate)
+            _, right_psd = compute_psd(processed_data[right_ch]['filtered'], sampling_rate)
+            
+            # Get alpha band indices
+            freqs = np.linspace(0, sampling_rate/2, len(left_psd))
+            alpha_mask = (freqs >= 8) & (freqs <= 12)
+            
+            # Calculate alpha power
+            left_alpha += np.trapezoid(left_psd[alpha_mask], freqs[alpha_mask])
+            right_alpha += np.trapezoid(right_psd[alpha_mask], freqs[alpha_mask])
         
         # Calculate overall arousal from beta/alpha ratio
         for ch in range(8):  # All EEG channels
-            total_beta += processed_data[ch]['buffer_data']['powers']['beta_mid'][t_idx]
-            total_alpha += processed_data[ch]['buffer_data']['powers']['alpha'][t_idx]
+            freqs, psd = compute_psd(processed_data[ch]['filtered'], sampling_rate)
+            alpha_mask = (freqs >= 8) & (freqs <= 12)
+            beta_mask = (freqs >= 13) & (freqs <= 30)
+            
+            total_alpha += np.trapezoid(psd[alpha_mask], freqs[alpha_mask])
+            total_beta += np.trapezoid(psd[beta_mask], freqs[beta_mask])
         
         # Calculate metrics
         valence = np.log(right_alpha + 1e-6) - np.log(left_alpha + 1e-6)  # Alpha asymmetry
@@ -1681,3 +1665,149 @@ def normalize_sample_timing(processed_data, fs, target_duration=200):
         processed_data[ch]['timing'] = timing_info
         
     return processed_data
+
+def save_frequency_domain_representation(processed_data, file_name, output_dir):
+    fig = go.Figure()
+
+    for ch_idx, ch_data in processed_data.items():
+        freqs, psd = compute_psd(ch_data['filtered'], ch_data['sampling_rate'])
+        fig.add_trace(go.Scatter(x=freqs, y=psd, name=f"Channel {ch_idx}"))
+
+    fig.update_layout(
+        title=f"Frequency Domain Representation - {file_name}",
+        xaxis_title="Frequency (Hz)",
+        yaxis_title="Power Spectral Density",
+        height=600
+    )
+
+    output_path = os.path.join(output_dir, f"{file_name}_frequency_domain.html")
+    fig.write_html(output_path)
+    print(f"Frequency domain representation saved to {output_path}")
+
+def save_emotion_matrix_visualization(emotion_matrix, file_names, output_dir):
+    emotion_matrix = np.array(emotion_matrix)
+    emotions = ['Excited', 'Angry', 'Sad', 'Calm']
+
+    fig = go.Figure(data=go.Heatmap(
+        z=emotion_matrix,
+        x=emotions,
+        y=file_names,
+        colorscale='Viridis'
+    ))
+
+    fig.update_layout(
+        title="Emotion Classification Matrix",
+        xaxis_title="Emotions",
+        yaxis_title="Files",
+        height=600
+    )
+
+    output_path = os.path.join(output_dir, "emotion_matrix.html")
+    fig.write_html(output_path)
+    print(f"Emotion matrix visualization saved to {output_path}")
+
+def plot_valence_arousal_space(valence, arousal, times):
+    """Create a 2D scatter plot for valence-arousal space with a time gradient."""
+    fig = go.Figure()
+
+    # Scatter plot with time gradient
+    fig.add_trace(
+        go.Scatter(
+            x=valence,
+            y=arousal,
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=times,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="Time (s)")
+            ),
+            name="Valence-Arousal"
+        )
+    )
+
+    # Update layout
+    fig.update_layout(
+        title="Valence-Arousal Space",
+        xaxis_title="Valence",
+        yaxis_title="Arousal",
+        height=600,
+        showlegend=False
+    )
+    return fig
+
+def smooth_emotional_state(processed_data, sampling_rate, smoothing_rate=5):
+    smoothed_states = []
+    time_points = []
+
+    for ch_idx, ch_data in processed_data.items():
+        buffer_times = ch_data['buffer_data']['times']
+        ratios = ch_data['buffer_data']['ratios']
+
+        # Smooth using moving average
+        for ratio_name, ratio_values in ratios.items():
+            smoothed_values = np.convolve(
+                ratio_values, np.ones(smoothing_rate) / smoothing_rate, mode='valid'
+            )
+            smoothed_states.append(smoothed_values)
+            time_points.append(buffer_times[:len(smoothed_values)])
+
+    return smoothed_states, time_points
+
+def generate_pdf_report(output_dir, emotion_matrix, file_names, valence_arousal_data):
+    """Generate a PDF report summarizing the classification results and interpretations."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+
+    # Title
+    pdf.set_font("Arial", style="B", size=16)
+    pdf.cell(200, 10, txt="EEG Emotion Classification Report", ln=True, align="C")
+    pdf.ln(10)
+
+    # Summary of Results
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt="Summary of Classification Results:", ln=True)
+    pdf.ln(5)
+
+    emotions = ['Excited', 'Angry', 'Sad', 'Calm']
+    for i, file_name in enumerate(file_names):
+        pdf.cell(200, 10, txt=f"File: {file_name}", ln=True)
+        for j, emotion in enumerate(emotions):
+            pdf.cell(200, 10, txt=f"  {emotion}: {emotion_matrix[i][j]:.2f}", ln=True)
+        pdf.ln(5)
+
+    # Interpretation
+    pdf.set_font("Arial", style="B", size=14)
+    pdf.cell(200, 10, txt="Interpretation of Results:", ln=True)
+    pdf.ln(5)
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, txt=(
+        "The classification results provide insights into the cognitive and emotional states of the participants. "
+        "For example:\n"
+        "- High 'Excited' scores indicate increased beta activity in frontal and central regions, suggesting heightened "
+        "engagement or alertness.\n"
+        "- High 'Calm' scores are associated with increased alpha activity in posterior regions, reflecting relaxation.\n"
+        "- 'Angry' scores are linked to increased beta activity in the right frontal region, indicating emotional tension.\n"
+        "- 'Sad' scores are associated with increased alpha activity in the right posterior region, reflecting withdrawal or low arousal."
+    ))
+    pdf.ln(10)
+
+    # Valence-Arousal Analysis
+    pdf.set_font("Arial", style="B", size=14)
+    pdf.cell(200, 10, txt="Valence-Arousal Analysis:", ln=True)
+    pdf.ln(5)
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, txt=(
+        "The valence-arousal space provides a 2D representation of emotional states over time. "
+        "Valence reflects the positivity or negativity of the emotional state, while arousal reflects the level of activation. "
+        "The scatter plot shows the distribution of emotional states across these dimensions."
+    ))
+    pdf.ln(10)
+
+    # Save PDF
+    pdf_output_path = os.path.join(output_dir, "EEG_Emotion_Classification_Report.pdf")
+    pdf.output(pdf_output_path)
+    print(f"PDF report saved to {pdf_output_path}")
