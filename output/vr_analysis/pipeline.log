@@ -1,0 +1,8 @@
+
+=== Comparative SVM Mode Analysis (20250515102017) ===
+Definitions for this analysis:
+- 'All channels': All 8 EEG channels (Fz, C3, Cz, C4, Pz, PO7, Oz, PO8) are used, and features are averaged across all these channels for classification.
+- 'Selected electrodes': Specific electrodes are used for specific metrics and emotion rules, e.g., Fz, C3, C4, PO7, PO8, with each channel contributing to particular features or emotion indices as described in the methods.
+In the 'selected electrodes' mode, the pipeline uses domain knowledge to assign different roles to each channel (e.g., frontal for arousal, posterior for relaxation), while in the 'all channels' mode, all 8 EEG channels are treated equally and their features are averaged.
+
+Mode: Selected electrodes (Fz, C3, C4, PO7, PO8)

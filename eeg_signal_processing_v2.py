@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 EEG Signal Processing Pipeline
 
@@ -7,6 +6,7 @@ This script implements advanced signal processing for EEG data analysis, includi
 - Signal filtering (bandpass and notch)
 - Spectral analysis using Welch's method
 - Band power calculations
+- SVM classifcation of emotions for a 2 second window
 - Advanced visualization
 """
 """
@@ -72,6 +72,21 @@ Key Notes:
         Left hemisphere positivity → C3 (central) and PO7 (posterior).
         Right hemisphere negativity → C4 (central) and PO8 (posterior).
 
+        VR Stimulus Analysis for EEG Data
+
+This script analyzes EEG recordings from VR headset sessions with different stimulus periods.
+
+Stimulus Pattern (Total duration: 3 minutes 20 seconds / 200 seconds):
+- 0-20 sec: white neutral
+- 20-50 sec: warm color
+- 50-80 sec: cold color
+- 80-110 sec: warm color
+- 110-140 sec: cold color
+- 140-170 sec: warm color
+- 170-200 sec: cold color
+
+The goal is to compare EEG data between warm and cold color stimulus periods
+and create visualizations to show differences in brain activity.
 
 """
 # === USAGE INSTRUCTIONS ===
@@ -85,31 +100,36 @@ Key Notes:
 import os
 import sys
 import subprocess
-
-"""
-# Check and install required packages
-required_packages = ['numpy', 'pandas', 'scipy', 'matplotlib', 'plotly', 'mne', 'scikit-learn', 'seaborn', 'pywavelets']
-for package in required_packages:
-    try:
-        __import__(package)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-"""
-# Import required libraries
 import numpy as np
 import pandas as pd
+import datetime
+import seaborn as sns
 import matplotlib.pyplot as plt
-from scipy import signal
+from scipy.signal import stft
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import mne
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from matplotlib.backends.backend_pdf import PdfPages
-import seaborn as sns
-import matplotlib.patches as patches
-import datetime
+from collections import Counter
+import scipy.signal as signal
 from scipy.signal import cwt, morlet2
 from fpdf import FPDF
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score, roc_curve, auc
+import plotly.io as pio
+import webbrowser
+import joblib
+from scipy.signal import correlate
+from imblearn.over_sampling import SMOTE  # [NEW] For class balancing
+from scipy import stats
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.feature_selection import RFE
+from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay
+import scipy.signal
+from scipy.stats import skew, kurtosis
+from scipy.signal import convolve
 
 # --- CONFIGURATION ---
 # Get the current script's directory
@@ -120,8 +140,8 @@ processed_folder = os.path.join(script_dir, 'processed')
 sampling_rate = 250  # Hz
 plot_duration_seconds = 210  # 3.5 minutes
 max_samples = plot_duration_seconds * sampling_rate
-timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-downsample_factor = 5  # Downsample to 50 Hz (250/5)
+timestamp = datetime.datetime.now().strftime("__%Y%m%d%H%M%S")
+downsample_factor = 1  # Downsample to 50 Hz (250/5)
 
 # Configure plotting settings
 sns.set_style("darkgrid")
@@ -131,6 +151,7 @@ sns.set(context='notebook', style='darkgrid', palette='deep', font='sans-serif',
 os.makedirs(output_folder, exist_ok=True)
 os.makedirs(processed_folder, exist_ok=True)
 os.makedirs(data_folder, exist_ok=True)
+os.makedirs('reports', exist_ok=True)
 
 # EEG frequency bands with more detailed beta bands
 FREQ_BANDS = {
@@ -190,9 +211,35 @@ WINDOW_CONFIGS = {
     }
 }
 
+def calculate_bandpower_ratios(band_powers):
+    """Calculate standard EEG bandpower ratios for a given band powers dict."""
+    # Avoid division by zero
+    def safe_div(a, b):
+        return a / b if b != 0 else 0.0
+
+    delta = band_powers.get('delta', 0)
+    theta = band_powers.get('theta', 0)
+    alpha = band_powers.get('alpha', 0)
+    beta_low = band_powers.get('beta_low', 0)
+    beta_mid = band_powers.get('beta_mid', 0)
+    beta = beta_low + beta_mid
+
+    ratios = {
+        'power_ratio_index': safe_div(beta, alpha),
+        'delta_alpha_ratio': safe_div(delta, alpha),
+        'theta_alpha_ratio': safe_div(theta, alpha),
+        'theta_beta_ratio': safe_div(theta, beta),
+        'theta_beta_alpha_ratio': safe_div(theta, (beta + alpha)),
+        'engagement_index': safe_div(beta, (alpha + theta)),
+    }
+    return ratios
+
 def bandpass_filter(data, lowcut, highcut, fs, order=4):
     """Apply a bandpass filter to the signal."""
-    nyq = 0.5 * fs  # Nyquist frequency
+    nyq = 0.5 * fs
+    margin = 0.1  # Hz
+    if highcut >= nyq:
+        highcut = nyq - margin
     low = lowcut / nyq
     high = highcut / nyq
     if not (0 < low < 1 and 0 < high < 1):
@@ -216,29 +263,103 @@ def compute_psd(data, fs, nperseg=None):
     freqs, psd = signal.welch(data, fs, nperseg=nperseg)
     return freqs, psd
 
+def compute_psD(data, fs, nperseg=None):
+    # Typo alias for compute_psd for legacy compatibility
+    return compute_psd(data, fs, nperseg)
+
 def calculate_band_powers(psd, freqs, bands=FREQ_BANDS):
     """Calculate power in specific frequency bands."""
     powers = {}
     for band_name, (low, high) in bands.items():
         mask = (freqs >= low) & (freqs <= high)
-        powers[band_name] = np.trapz(psd[mask], freqs[mask])
+        powers[band_name] = np.trapezoid(psd[mask], freqs[mask])
     return powers
 
-def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.5, downsample=True):
+
+# Now you can use `baseline_processed` for normalization, plotting, or as a reference in your analysis.
+
+def downsample_with_antialiasing(data, fs, factor):
+    """Downsample signal with anti-aliasing filter."""
+    from scipy.signal import butter, filtfilt, decimate
+    if factor == 1:
+        return data, fs
+    nyq = 0.5 * fs
+    cutoff = 0.8 * (nyq / factor)
+    b, a = butter(4, cutoff / nyq, btype='low')
+    filtered = filtfilt(b, a, data)
+    downsampled = decimate(filtered, factor, ftype='iir', zero_phase=True)
+    new_fs = fs // factor
+    return downsampled, new_fs
+
+def apply_antialiasing_filter(data, fs, cutoff=24, order=4):
+    """Apply a lowpass filter for anti-aliasing before downsampling."""
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = signal.butter(order, normal_cutoff, btype='low')
+    return signal.filtfilt(b, a, data)
+
+def calculate_bandpower_with_buffer(data, fs, buffer_size, buffer_overlap):
+    """
+    Calculate time-varying band powers and ratios using a sliding buffer.
+    Args:
+        data (array): 1D EEG data
+        fs (float): Sampling rate
+        buffer_size (float): Buffer size in seconds
+        buffer_overlap (float): Overlap in seconds
+    Returns:
+        tuple: (buffer_times, buffer_powers, buffer_ratios)
+    """
+    buffer_len = int(buffer_size * fs)
+    step_len = int((buffer_size - buffer_overlap) * fs)
+    n_samples = len(data)
+    buffer_times = []
+    buffer_powers = {band: [] for band in FREQ_BANDS}
+    buffer_ratios = {ratio: [] for ratio in [
+        'power_ratio_index',
+        'delta_alpha_ratio',
+        'theta_alpha_ratio',
+        'theta_beta_ratio',
+        'theta_beta_alpha_ratio',
+        'engagement_index']}
+
+    for start in range(0, n_samples - buffer_len + 1, step_len):
+        end = start + buffer_len
+        segment = data[start:end]
+        freqs, psd = compute_psd(segment, fs)
+        band_powers = calculate_band_powers(psd, freqs)
+        ratios = calculate_bandpower_ratios(band_powers)
+        for band in FREQ_BANDS:
+            buffer_powers[band].append(band_powers[band])
+        for ratio in buffer_ratios:
+            buffer_ratios[ratio].append(ratios[ratio])
+        buffer_times.append((start + end) / 2 / fs)
+
+    # Convert lists to numpy arrays
+    buffer_times = np.array(buffer_times)
+    for band in buffer_powers:
+        buffer_powers[band] = np.array(buffer_powers[band])
+    for ratio in buffer_ratios:
+        buffer_ratios[ratio] = np.array(buffer_ratios[ratio])
+    return buffer_times, buffer_powers, buffer_ratios
+
+def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.5, downsample=True, classification_mode=None, output_folder=None, timestamp=None, pdf=None):
     """Process EEG data from a file with advanced buffer-based analysis.
-    
     Args:
         filepath (str): Path to the data file
         channels (list): List of channel indices to process
         buffer_size (float): Size of buffer in seconds
-        buffer_overlap (float): Overlap between buffers in seconds
+        buffer_overlap (float): Overlap in seconds
         downsample (bool): Whether to downsample the data
-        
+        classification_mode (str): 'selch', 'allch', or None for both
+        output_folder (str): Where to save outputs (for autocorr plot)
+        timestamp (str): Timestamp for output naming
+        pdf (PdfPages): PDF object to add plots to
     Returns:
         dict: Processed data including time-varying bandpowers and ratios
     """
+    print(f"Processing EEG data from {os.path.basename(filepath)}...")
     # Read data
-    df = pd.read_csv(filepath, header=None)
+    df = pd.read_csv(filepath, header=None, low_memory=False)
     df = df.iloc[:max_samples]
     
     if channels is None:
@@ -279,6 +400,9 @@ def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.
                 filtered, current_fs, buffer_size, buffer_overlap
             )
             
+            # Extract statistical features
+            stat_features = extract_statistical_features(filtered, window_size=buffer_size, step_size=buffer_overlap, fs=current_fs)
+            
             # Store all data for this channel
             processed_data[channel_index] = {
                 'raw': data,
@@ -293,202 +417,95 @@ def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.
                     'powers': buffer_powers,
                     'ratios': buffer_ratios
                 },
-                'sampling_rate': current_fs  # Store the actual sampling rate used
+                'sampling_rate': current_fs,  # Store the actual sampling rate used
+                'stat_features': stat_features  # Store statistical features
             }
             
         except Exception as e:
             print(f"Error processing channel {channel_index}: {e}")
-            
+    
+    # --- SVM window-wise affective state prediction ---
+    try:
+        modes = ['selch', 'allch'] if classification_mode is None else [classification_mode]
+        for mode in modes:
+            mode_str = 'allch' if mode == 'allch' else 'selch'
+            if mode == 'selch':
+                svm_path = os.path.join(script_dir, 'output', 'combined', 'svm_model_selch.joblib')
+                scaler_path = os.path.join(script_dir, 'output', 'combined', 'scaler_selch.joblib')
+                feature_fn = extract_features_selected
+                sel_indices = [ELECTRODES['Fz'], ELECTRODES['C3'], ELECTRODES['C4'], ELECTRODES['PO7'], ELECTRODES['PO8']]
+            elif mode == 'allch':
+                svm_path = os.path.join(script_dir, 'output', 'combined', 'svm_model_allch.joblib')
+                scaler_path = os.path.join(script_dir, 'output', 'combined', 'scaler_allch.joblib')
+                feature_fn = extract_features_allch
+                sel_indices = list(range(NUM_CHANNELS))
+            else:
+                continue
+            if os.path.exists(svm_path) and os.path.exists(scaler_path):
+                svm = joblib.load(svm_path)
+                scaler = joblib.load(scaler_path)
+                ref_ch = sel_indices[0]
+                n_windows = len(processed_data[ref_ch]['buffer_data']['times'])
+                feature_mat = []
+                for i in range(n_windows):
+                    window_data = {}
+                    for ch in sel_indices:
+                        window_data[ch] = {
+                            'powers': {band: processed_data[ch]['buffer_data']['powers'][band][i] for band in FREQ_BANDS},
+                            'power_ratios': {ratio: processed_data[ch]['buffer_data']['ratios'][ratio][i] for ratio in [
+                                'power_ratio_index',
+                                'delta_alpha_ratio',
+                                'theta_alpha_ratio',
+                                'theta_beta_ratio',
+                                'theta_beta_alpha_ratio',
+                                'engagement_index']}
+                        }
+                    feature_vec = feature_fn(window_data)
+                    feature_mat.append(feature_vec)
+                feature_mat = np.array(feature_mat)
+                # For 'allch' mode, average features across all channels (reshape to [n_windows, n_features_per_ch], then mean)
+                if mode == 'allch' and feature_mat.ndim == 2:
+                    n_features_per_ch = int(feature_mat.shape[1] / NUM_CHANNELS)
+                    feature_mat = feature_mat.reshape((n_windows, NUM_CHANNELS, n_features_per_ch)).mean(axis=1)
+                # Remove or impute NaNs before classification
+                feature_mat = np.nan_to_num(feature_mat, nan=0.0)
+                feature_mat_scaled = scaler.transform(feature_mat)
+                window_labels = svm.predict(feature_mat_scaled)
+                # Map integer labels to affective state names if possible
+                if hasattr(svm, 'classes_'):
+                    label_map = {i: str(c).capitalize() for i, c in enumerate(svm.classes_)}
+                    window_labels_named = [label_map.get(lbl, str(lbl)) for lbl in window_labels]
+                else:
+                    window_labels_named = [str(lbl) for lbl in window_labels]
+                # Store in processed_data dict (mode-specific)
+                processed_data[f'affective_state_labels_{mode}'] = window_labels_named
+                # --- Rule-based emotion labeling ---
+                n_windows = len(processed_data[ref_ch]['buffer_data']['times'])
+                rule_labels = []
+                for i in range(n_windows):
+                    window_band_powers = {}
+                    for ch_name, ch_idx in ELECTRODES.items():
+                        window_band_powers[ch_idx] = {band: processed_data[ch_idx]['buffer_data']['powers'][band][i] for band in FREQ_BANDS}
+                    rule_labels.append(label_emotion_window(window_band_powers, ELECTRODES, EMOTION_THRESHOLDS))
+                processed_data[f'affective_state_labels_rule_{mode}'] = rule_labels
+            else:
+                # Only print the warning if classification_mode is explicitly set (i.e., not None),
+                # to avoid spamming during batch feature extraction before models are trained.
+                if classification_mode is not None:
+                    print(f"[WARN] SVM model or scaler not found at expected paths: {svm_path}, {scaler_path}")
+    except Exception as e:
+        print(f"[WARN] Could not compute SVM affective state labels: {e}")
+
+    # --- Autocorrelation plot integration ---
+    if output_folder is not None and timestamp is not None:
+        # Pick a representative channel (e.g., Fz)
+        ch_idx = ELECTRODES['Fz'] if 'Fz' in ELECTRODES else 0
+        filtered_signal = processed_data[ch_idx]['filtered']
+        filename = os.path.basename(filepath)
+        class_mode_suffix = f"_{classification_mode}" if classification_mode else ""
+        plot_eeg_autocorrelation(filtered_signal, current_fs, output_folder, filename, channel_labels[ch_idx], timestamp, class_mode_suffix, pdf=pdf)
+
     return processed_data
-
-def plot_processed_data(processed_data, filename, output_pdf=None):
-    """Create comprehensive visualizations of processed EEG data."""
-    n_channels = len(processed_data)
-    fig, axes = plt.subplots(8, 1, figsize=(15, 35))  # Added 2 more subplots
-
-    # Plot 1: Time domain
-    ax = axes[0]
-    for ch_idx, ch_data in processed_data.items():
-        ax.plot(ch_data['time'], ch_data['raw'], '--', alpha=0.3,
-                label=f'{channel_labels[ch_idx]} (Raw)')
-        ax.plot(ch_data['time'], ch_data['filtered'],
-                label=f'{channel_labels[ch_idx]} (Filtered)')    # Add time markers for key points
-    add_time_markers(ax, [20, 50, 80, 110, 140, 170, 200])
-    
-    ax.set_title(f'{filename} - Time Domain', fontsize=12)
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Amplitude')
-    ax.grid(True)
-    ax.legend(fontsize=8, bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    # Plots 2-5: Individual bands
-    bands = list(FREQ_BANDS.keys())
-    for i, band in enumerate(bands):
-        ax = axes[i + 1]
-        for ch_idx, ch_data in processed_data.items():
-            # Apply bandpass filter for the current band
-            band_filtered = bandpass_filter(ch_data['raw'],
-                                         FREQ_BANDS[band][0],
-                                         FREQ_BANDS[band][1],
-                                         sampling_rate)
-            ax.plot(ch_data['time'], band_filtered,
-                   label=f'{channel_labels[ch_idx]} ({band})')
-        ax.set_title(f'{filename} - {band.upper()} band', fontsize=12)
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Amplitude')
-        ax.grid(True)
-        ax.legend(fontsize=8, bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    plt.tight_layout()
-    
-    if output_pdf is not None:
-        output_pdf.savefig(fig, bbox_inches='tight')
-    plt.close()
-
-def create_interactive_visualization(raw_data, file_processed_data, baseline_data=None):
-    """Create an interactive visualization including bandpower ratios.
-    
-    Args:
-        raw_data (dict): Raw EEG data
-        file_processed_data (dict): Processed data for current file
-        baseline_data (dict): Optional baseline data for comparison
-    """
-    fig = make_subplots(
-        rows=6, cols=1,
-        subplot_titles=[
-            'Time Domain',
-            'Power Spectral Density',
-            'Band Powers by Channel',
-            'Bandpower Ratios by Channel',
-            'Time-varying Bandpowers',
-            'Time-varying Ratios'
-        ],
-        vertical_spacing=0.08,
-        row_heights=[0.2, 0.2, 0.15, 0.15, 0.15, 0.15]
-    )
-    
-    # Plot 1: Time domain
-    for ch_idx, ch_data in file_processed_data.items():
-        fig.add_trace(
-            go.Scatter(
-                x=ch_data['time'],
-                y=ch_data['filtered'],
-                name=f'{channel_labels[ch_idx]}',
-                line=dict(dash='solid')
-            ),
-            row=1, col=1
-        )
-    
-    # Plot 2: PSD
-    for ch_idx, ch_data in file_processed_data.items():
-        fig.add_trace(
-            go.Scatter(
-                x=ch_data['freqs'],
-                y=ch_data['psd'],
-                name=channel_labels[ch_idx]
-            ),
-            row=2, col=1
-        )
-    
-    # Plot 3: Band powers by channel
-    channels = list(file_processed_data.keys())
-    for band in FREQ_BANDS:
-        powers = [file_processed_data[ch]['powers'][band] for ch in channels]
-        fig.add_trace(
-            go.Bar(
-                name=band,
-                x=[channel_labels[ch] for ch in channels],
-                y=powers
-            ),
-            row=3, col=1
-        )
-    
-    # Plot 4: Power ratios by channel
-    ratio_names = [
-        'power_ratio_index',
-        'delta_alpha_ratio',
-        'theta_alpha_ratio',
-        'theta_beta_ratio',
-        'theta_beta_alpha_ratio',
-        'engagement_index'
-    ]
-    
-    for ch_idx in channels:
-        ratios = [file_processed_data[ch_idx]['power_ratios'][ratio] for ratio in ratio_names]
-        fig.add_trace(
-            go.Bar(
-                name=channel_labels[ch_idx],
-                x=ratio_names,
-                y=ratios
-            ),
-            row=4, col=1
-        )
-    
-    # Plot 5: Time-varying bandpowers
-    ref_channel = channels[0]  # Use first channel as reference
-    buffer_times = file_processed_data[ref_channel]['buffer_data']['times']
-    
-    for band in FREQ_BANDS:
-        fig.add_trace(
-            go.Scatter(
-                x=buffer_times,
-                y=file_processed_data[ref_channel]['buffer_data']['powers'][band],
-                name=f'{band} power',
-                mode='lines'
-            ),
-            row=5, col=1
-        )
-    
-    # Plot 6: Time-varying ratios
-    for ratio in ratio_names:
-        fig.add_trace(
-            go.Scatter(
-                x=buffer_times,
-                y=file_processed_data[ref_channel]['buffer_data']['ratios'][ratio],
-                name=ratio,
-                mode='lines'
-            ),
-            row=6, col=1
-        )
-    
-    # Update layout
-    fig.update_layout(
-        height=1800,
-        showlegend=True,
-        legend=dict(x=1.1, y=1),
-        title_text="EEG Analysis with Bandpower Ratios"
-    )
-    
-    # Update axes labels
-    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
-    fig.update_yaxes(title_text="Amplitude", row=1, col=1)
-    fig.update_xaxes(title_text="Frequency (Hz)", row=2, col=1)
-    fig.update_yaxes(title_text="Power/Frequency", row=2, col=1)
-    fig.update_xaxes(title_text="Channel", row=3, col=1)
-    fig.update_yaxes(title_text="Power", row=3, col=1)
-    fig.update_xaxes(title_text="Ratio Type", row=4, col=1)
-    fig.update_yaxes(title_text="Ratio Value", row=4, col=1)
-    fig.update_xaxes(title_text="Time (s)", row=5, col=1)
-    fig.update_yaxes(title_text="Power", row=5, col=1)
-    fig.update_xaxes(title_text="Time (s)", row=6, col=1)
-    fig.update_yaxes(title_text="Ratio Value", row=6, col=1)
-    
-    return fig
-
-def compute_stft(data, fs, nperseg=256, noverlap=None):
-    """Compute Short-Time Fourier Transform."""
-    if noverlap is None:
-        noverlap = nperseg // 2
-    f, t, Zxx = stft(data, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    return f, t, np.abs(Zxx)
-
-def compute_wavelet(data, fs, wavelet_width=5.0):
-    """Compute Wavelet Transform using continuous wavelet transform."""
-    # Use Morlet wavelet for analysis
-    scales = np.arange(1, 128)
-    frequencies = fs / (scales * wavelet_width)
-    coef = cwt(data, morlet2, scales, w=wavelet_width)
-    return frequencies, np.abs(coef)
 
 def calculate_normalized_band_powers(psd, freqs, bands=FREQ_BANDS):
     """Calculate normalized power in specific frequency bands (0-1 scale)."""
@@ -510,7 +527,7 @@ def calculate_alpha_asymmetry(left_data, right_data, fs):
     """Calculate alpha asymmetry between left and right channels."""
     # Calculate alpha power for both channels
     _, left_psd = compute_psd(left_data, fs)
-    _, right_psd = compute_psd(right_data, fs)
+    _, right_psd = compute_psD(right_data, fs)
     
     # Get alpha band indices
     freqs = np.linspace(0, fs/2, len(left_psd))
@@ -653,12 +670,25 @@ def load_eeg_data(filepath, do_downsample=True):
     
     return df
 
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+    """Apply a bandpass filter to the signal."""
+    nyq = 0.5 * fs
+    margin = 0.1  # Hz
+    if highcut >= nyq:
+        highcut = nyq - margin
+    low = lowcut / nyq
+    high = highcut / nyq
+    if not (0 < low < 1 and 0 < high < 1):
+        raise ValueError(f"Invalid cutoff frequencies: low={lowcut}, high={highcut}, fs={fs}")
+    b, a = signal.butter(order, [low, high], btype='band')
+    return signal.filtfilt(b, a, data)
+
 def filter_eeg(data, fs):
-    """Apply bandpass and notch filters to EEG data."""
-    # Initial high pass filter at 0.5 Hz to remove DC
-    data = bandpass_filter(data, 0.5, 30, fs, order=4)
-    # Apply 50 Hz notch filter for power line noise
-    data = notch_filter(data, 50, fs)
+    # Use 24 Hz as high cutoff for fs=50Hz
+    data = bandpass_filter(data, 0.5, 24, fs, order=4)
+    # Only apply 50 Hz notch if fs > 100 Hz
+    if fs > 100:
+        data = notch_filter(data, 50, fs)
     return data
 
 def normalize_across_files(all_processed_data):
@@ -865,379 +895,26 @@ def create_alpha_asymmetry_comparison(all_processed_data):
     
     return fig
 
-def calculate_bandpower_ratios(powers):
-    """Calculate various bandpower ratios from frequency bands.
-    
-    Args:
-        powers (dict): Dictionary containing band powers
-        
-    Returns:
-        dict: Dictionary containing calculated ratios
-    """
-    ratios = {}
-    
-    # Power Ratio Index = (delta + theta) / (alpha + beta)
-    ratios['power_ratio_index'] = (powers['delta'] + powers['theta']) / (powers['alpha'] + powers['beta_mid'])
-    
-    # Delta/Alpha Ratio
-    ratios['delta_alpha_ratio'] = powers['delta'] / powers['alpha']
-    
-    # Theta/Alpha Ratio
-    ratios['theta_alpha_ratio'] = powers['theta'] / powers['alpha']
-    
-    # Theta/Beta Ratio
-    ratios['theta_beta_ratio'] = powers['theta'] / powers['beta_mid']
-    
-    # Theta/(Alpha + Beta) Ratio
-    ratios['theta_beta_alpha_ratio'] = powers['theta'] / (powers['alpha'] + powers['beta_mid'])
-    
-    # Engagement Index = beta/(theta + alpha)
-    ratios['engagement_index'] = powers['beta_mid'] / (powers['theta'] + powers['alpha'])
-    
-    return ratios
-
-def calculate_bandpower_with_buffer(data, fs, buffer_size=2.0, buffer_overlap=0.5, bands=FREQ_BANDS):
-    """Calculate bandpower using sliding buffer.
-    
-    Args:
-        data (array): Input signal
-        fs (float): Sampling frequency
-        buffer_size (float): Size of buffer in seconds
-        buffer_overlap (float): Overlap between buffers in seconds
-        bands (dict): Frequency bands
-        
-    Returns:
-        tuple: Time points and bandpowers over time
-    """
-    buffer_samples = int(buffer_size * fs)
-    overlap_samples = int(buffer_overlap * fs)
-    step_size = buffer_samples - overlap_samples
-    
-    # Calculate number of buffers
-    n_buffers = (len(data) - overlap_samples) // step_size
-    
-    # Initialize output arrays
-    times = []
-    bandpowers = {band: [] for band in bands.keys()}
-    bandpower_ratios = {
-        'power_ratio_index': [], 
-        'delta_alpha_ratio': [],
-        'theta_alpha_ratio': [],
-        'theta_beta_ratio': [],
-        'theta_beta_alpha_ratio': [],
-        'engagement_index': []
-    }
-    
-    for i in range(n_buffers):
-        start = i * step_size
-        end = start + buffer_samples
-        
-        # Get data segment
-        segment = data[start:end]
-        
-        # Calculate PSD for this segment
-        freqs, psd = compute_psd(segment, fs)
-        
-        # Calculate band powers
-        powers = calculate_normalized_band_powers(psd, freqs)
-        
-        # Calculate ratios
-        ratios = calculate_bandpower_ratios(powers)
-        
-        # Store results
-        times.append((start + end) / (2 * fs))  # Center time of buffer
-        for band, power in powers.items():
-            bandpowers[band].append(power)
-        for ratio_name, ratio in ratios.items():
-            bandpower_ratios[ratio_name].append(ratio)
-    
-    return np.array(times), bandpowers, bandpower_ratios
-
-def apply_antialiasing_filter(data, fs, cutoff_freq):
-    """Apply anti-aliasing filter before downsampling.
-    
-    Args:
-        data (array): Input signal
-        fs (float): Original sampling frequency
-        cutoff_freq (float): Cutoff frequency for the filter
-        
-    Returns:
-        array: Filtered signal
-    """
-    nyquist = fs / 2
-    normalized_cutoff = cutoff_freq / nyquist
-    b, a = signal.butter(8, normalized_cutoff, btype='low')
-    return signal.filtfilt(b, a, data)
-
-def downsample_with_antialiasing(data, fs, downsample_factor):
-    """Downsample signal with proper anti-aliasing filter.
-    
-    Args:
-        data (array): Input signal
-        fs (float): Original sampling frequency
-        downsample_factor (int): Factor by which to downsample
-        
-    Returns:
-        tuple: (downsampleed_data, new_fs)
-    """
-    # Apply anti-aliasing filter before decimation
-    # Cutoff frequency should be slightly less than the Nyquist frequency of the target sampling rate
-    new_fs = fs / downsample_factor
-    cutoff_freq = 0.8 * (new_fs / 2)  # Use 80% of new Nyquist frequency
-    
-    filtered_data = apply_antialiasing_filter(data, fs, cutoff_freq)
-    downsampled_data = signal.decimate(filtered_data, downsample_factor, n=None, ftype='iir', zero_phase=True)
-    
-    return downsampled_data, new_fs
-
-def main():
-    input_dir = os.path.join(os.getcwd(), 'data', 'raw', 'toTest')
-    output_dir = os.path.join(os.getcwd(), 'output')
-    os.makedirs(output_dir, exist_ok=True)
-
-    eeg_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
-    if not eeg_files:
-        print(f"No EEG files found in {input_dir}")
-        return
-
-    all_processed_data = {}
-    emotion_matrix = []
-    valence_arousal_data = []
-
-    for eeg_file in eeg_files:
-        file_path = os.path.join(input_dir, eeg_file)
-        print(f"Processing {eeg_file}...")
-        processed_data = process_eeg_data(file_path)
-        all_processed_data[eeg_file] = processed_data
-
-        # Classify emotions and calculate valence-arousal
-        times = processed_data[0]['buffer_data']['times']
-        emotions, probabilities = [], []
-        for t_idx in range(len(times)):
-            emotion, scores = classify_emotional_state(
-                {ch: {'powers': {band: powers[t_idx] for band, powers in ch_data['buffer_data']['powers'].items()}}
-                 for ch, ch_data in processed_data.items()}
-            )
-            emotions.append(emotion)
-            probabilities.append(scores)
-
-        valence, arousal, _ = calculate_valence_arousal(processed_data, sampling_rate)
-        valence_arousal_data.append((valence, arousal))
-
-        # Save emotion probabilities
-        emotion_matrix.append([np.mean([p[emotion] for p in probabilities]) for emotion in ['excited', 'angry', 'sad', 'calm']])
-
-        # Create visualizations
-        smoothed_fig = plot_smoothed_emotional_estimation(processed_data, times, emotions, probabilities)
-        smoothed_fig.write_html(os.path.join(output_dir, f"{eeg_file}_smoothed_emotions.html"))
-
-        va_fig = plot_valence_arousal_space(valence, arousal, times)
-        va_fig.write_html(os.path.join(output_dir, f"{eeg_file}_valence_arousal.html"))
-
-        print(f"Visualizations saved for {eeg_file}")
-
-    # Generate PDF report
-    generate_pdf_report(output_dir, emotion_matrix, eeg_files, valence_arousal_data)
-
-    print("Processing complete.")
-
-def process_and_classify_emotions(input_dir, output_dir):
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # List all files in the input directory
-    eeg_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
-    emotion_matrix = []
-
-    for file_name in eeg_files:
-        file_path = os.path.join(input_dir, file_name)
-        print(f"Processing {file_name}...")
-
-        # Process EEG data
-        processed_data = process_eeg_data(file_path)
-
-        # Classify emotions
-        emotion, scores = classify_emotional_state(processed_data)
-        emotion_matrix.append(scores)
-
-        # Save frequency domain representation
-        save_frequency_domain_representation(processed_data, file_name, output_dir)
-
-    # Save emotion matrix as a heatmap
-    save_emotion_matrix_visualization(emotion_matrix, eeg_files, output_dir)
-
-    print("Processing complete.")
-
-if __name__ == "__main__":
-    main()
-
-def get_channel_positions():
-    """Get 2D positions for EEG channels in standard 10-20 layout."""
-    # Approximate 2D positions for the channels we have
-    positions = {
-        'Fz': (0.0, 0.7),      # Front midline
-        'C3': (-0.5, 0.0),     # Left central
-        'Cz': (0.0, 0.0),      # Central midline
-        'C4': (0.5, 0.0),      # Right central
-        'Pz': (0.0, -0.5),     # Parietal midline
-        'PO7': (-0.7, -0.7),   # Left parieto-occipital
-        'Oz': (0.0, -0.7),     # Occipital midline
-        'PO8': (0.7, -0.7),    # Right parieto-occipital
-    }
-    return positions
-
-def calculate_valence_arousal(processed_data, sampling_rate):
-    """Calculate valence and arousal metrics from EEG data over time.
-    
-    Valence: Based on alpha asymmetry between left/right hemispheres
-    Arousal: Based on beta/alpha ratio across channels
-    
-    Returns:
-        tuple: (valence_scores, arousal_scores, times)
-    """
-    # Get relevant channel pairs for valence calculation
-    left_channels = [1, 5]  # C3, PO7 
-    right_channels = [3, 7]  # C4, PO8
-    
-    # Initialize arrays for results
-    ref_channel = processed_data[0]
-    buffer_times = ref_channel['buffer_data']['times']
-    
-    # Calculate metrics for each time window
-    for t_idx, _ in enumerate(buffer_times):
-        # Calculate hemispheric alpha power
-        left_alpha = 0
-        right_alpha = 0
-        total_beta = 0
-        total_alpha = 0
-        
-        # Calculate alpha power for both channels
-        for left_ch, right_ch in zip(left_channels, right_channels):
-            _, left_psd = compute_psd(processed_data[left_ch]['filtered'], sampling_rate)
-            _, right_psd = compute_psd(processed_data[right_ch]['filtered'], sampling_rate)
-            
-            # Get alpha band indices
-            freqs = np.linspace(0, sampling_rate/2, len(left_psd))
-            alpha_mask = (freqs >= 8) & (freqs <= 12)
-            
-            # Calculate alpha power
-            left_alpha += np.trapezoid(left_psd[alpha_mask], freqs[alpha_mask])
-            right_alpha += np.trapezoid(right_psd[alpha_mask], freqs[alpha_mask])
-        
-        # Calculate overall arousal from beta/alpha ratio
-        for ch in range(8):  # All EEG channels
-            freqs, psd = compute_psd(processed_data[ch]['filtered'], sampling_rate)
-            alpha_mask = (freqs >= 8) & (freqs <= 12)
-            beta_mask = (freqs >= 13) & (freqs <= 30)
-            
-            total_alpha += np.trapezoid(psd[alpha_mask], freqs[alpha_mask])
-            total_beta += np.trapezoid(psd[beta_mask], freqs[beta_mask])
-        
-        # Calculate metrics
-        valence = np.log(right_alpha + 1e-6) - np.log(left_alpha + 1e-6)  # Alpha asymmetry
-        arousal = np.log(total_beta / (total_alpha + 1e-6))  # Beta/alpha ratio
-        
-        times.append(buffer_times[t_idx])
-        valence_scores.append(valence)
-        arousal_scores.append(arousal)
-    
-    return np.array(valence_scores), np.array(arousal_scores), np.array(times)
-
-def plot_valence_arousal_over_time(valence, arousal, times):
-    """Plot valence and arousal changes over time."""
-    fig = make_subplots(
-        rows=3, cols=1,
-        subplot_titles=('Valence over Time', 'Arousal over Time', 'Valence-Arousal Space'),
-        vertical_spacing=0.12
-    )
-    
-    # Plot valence over time
-    fig.add_trace(
-        go.Scatter(x=times, y=valence, mode='lines', name='Valence'),
-        row=1, col=1
-    )
-    
-    # Plot arousal over time
-    fig.add_trace(
-        go.Scatter(x=times, y=arousal, mode='lines', name='Arousal'),
-        row=2, col=1
-    )
-    
-    # Plot 2D valence-arousal space with time color gradient
-    fig.add_trace(
-        go.Scatter(
-            x=valence, 
-            y=arousal,
-            mode='markers',
-            marker=dict(
-                size=8,
-                color=times,
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title='Time (s)')
-            ),
-            name='V-A State'
-        ),
-        row=3, col=1
-    )
-    
-    # Update layout
-    fig.update_layout(
-        height=900,
-        showlegend=True,
-        title_text="Valence-Arousal Analysis Over Time"
-    )
-    
-    # Update axes labels
-    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
-    fig.update_yaxes(title_text="Valence", row=1, col=1)
-    fig.update_xaxes(title_text="Time (s)", row=2, col=1)
-    fig.update_yaxes(title_text="Arousal", row=2, col=1)
-    fig.update_xaxes(title_text="Valence", row=3, col=1)
-    fig.update_yaxes(title_text="Arousal", row=3, col=1)
-    
-    return fig
-
-def plot_alpha_asymmetry_over_time(processed_data):
-    """Plot alpha asymmetry changes over time for different channel pairs."""
-    # Channel pairs for asymmetry calculation
-    channel_pairs = [
-        (1, 3, "C3-C4"),  # Central L-R
-        (5, 7, "PO7-PO8")  # Parieto-occipital L-R
+def extract_features(file_data):
+    """Extract features from processed EEG data for machine learning."""
+    features = []
+    # Aggregate mean band powers across all channels
+    for band in FREQ_BANDS:
+        band_powers = [ch_data['powers'][band] for ch_data in file_data.values() if 'powers' in ch_data]
+        features.append(np.mean(band_powers))
+    # Aggregate mean ratios across all channels
+    ratio_names = [
+        'power_ratio_index',
+        'delta_alpha_ratio',
+        'theta_alpha_ratio',
+        'theta_beta_ratio',
+        'theta_beta_alpha_ratio',
+        'engagement_index'
     ]
-    
-    # Get time points from first channel
-    times = processed_data[0]['buffer_data']['times']
-    
-    fig = go.Figure()
-    
-    for left_ch, right_ch, pair_name in channel_pairs:
-        # Calculate asymmetry for each time point
-        asymmetry = []
-        for t_idx, _ in enumerate(times):
-            left_alpha = processed_data[left_ch]['buffer_data']['powers']['alpha'][t_idx]
-            right_alpha = processed_data[right_ch]['buffer_data']['powers']['alpha'][t_idx]
-            asym = np.log(right_alpha + 1e-6) - np.log(left_alpha + 1e-6)
-            asymmetry.append(asym)
-        
-        fig.add_trace(
-            go.Scatter(
-                x=times,
-                y=asymmetry,
-                mode='lines',
-                name=f'Asymmetry {pair_name}'
-            )
-        )
-    
-    fig.update_layout(
-        title="Alpha Asymmetry Over Time",
-        xaxis_title="Time (s)",
-        yaxis_title="Asymmetry Score (log right/left ratio)",
-        height=600,
-        showlegend=True
-    )
-    
-    return fig
+    for ratio in ratio_names:
+        ratio_vals = [ch_data['power_ratios'][ratio] for ch_data in file_data.values() if 'power_ratios' in ch_data]
+        features.append(np.mean(ratio_vals))
+    return np.array(features)
 
 # Detection and classification functions
 
@@ -1257,485 +934,398 @@ def detect_artifacts(acc_data, gyr_data, threshold=0.3):
     motion_score = acc_magnitude + gyr_magnitude
     return motion_score <= threshold
 
-def classify_emotional_state(processed_data, window_size='short', thresholds=None):
-    """Classify emotional state using processed EEG features.
-    
-    Args:
-        processed_data: Dictionary containing processed channel data
-        window_size: 'short' (5s) or 'long' (10s)
-        thresholds: Optional auto-quantized thresholds
-        
-    Returns:
-        str: Classified emotion ('excited', 'angry', 'sad', 'calm')
-        dict: Confidence scores for each emotion
-    """
-    # Get window parameters
-    window_params = WINDOW_CONFIGS[window_size]
-    window_samples = int(window_params['duration'] * sampling_rate)
-    
-    # Calculate features for each emotion
-    scores = {
-        'excited': 0.0,
-        'angry': 0.0,
-        'sad': 0.0,
-        'calm': 0.0
-    }
-    
-    # Excited state: high beta, low alpha in frontal/central
-    beta_power = 0
-    alpha_power = 0
-    for ch_name in EMOTION_CHANNELS['excited']:
-        ch_idx = ELECTRODES[ch_name]
-        ch_data = processed_data[ch_idx]
-        beta_power += ch_data['powers']['beta_mid']
-        alpha_power += ch_data['powers']['alpha']
-    excited_score = beta_power / (alpha_power + 1e-6)
-    scores['excited'] = excited_score
-    
-    # Angry state: right frontal beta (C4)
-    ch_idx = ELECTRODES['C4']
-    angry_score = processed_data[ch_idx]['powers']['beta_mid']
-    scores['angry'] = angry_score
-    
-    # Sad state: right posterior alpha (PO8)
-    ch_idx = ELECTRODES['PO8']
-    sad_score = processed_data[ch_idx]['powers']['alpha']
-    scores['sad'] = sad_score
-    
-    # Calm state: left posterior alpha (PO7)
-    ch_idx = ELECTRODES['PO7']
-    calm_score = processed_data[ch_idx]['powers']['alpha']
-    scores['calm'] = calm_score
-    
-    # Normalize scores
-    total = sum(scores.values()) + 1e-6
-    scores = {k: v/total for k, v in scores.items()}
-    
-    # Classify based on highest score
-    emotion = max(scores.items(), key=lambda x: x[1])[0]
-    
-    return emotion, scores
 
 def create_emotion_visualization(processed_data, window_size='short'):
-    """Create interactive visualization of emotional state classification.
+    """Create an interactive visualization including bandpower ratios.
     
     Args:
-        processed_data: Dictionary of processed EEG data
-        window_size: 'short' (5s) or 'long' (10s)
+        raw_data (dict): Raw EEG data
+        file_processed_data (dict): Processed data for current file
+        baseline_data (dict): Optional baseline data for comparison
     """
-    window_params = WINDOW_CONFIGS[window_size]
-    
-    # Create figure with subplots
     fig = make_subplots(
-        rows=4, cols=2,
-        subplot_titles=(
-            'Beta Power (Frontal/Central)',
-            'Emotional State Probability',
-            'Alpha Asymmetry (PO7-PO8)',
-            'Beta Asymmetry (C3-C4)',
-            'Time-varying Band Powers',
-            'Motion Artifacts',
-            'Valence-Arousal Space',
-            'State Transitions'
-        ),
-        specs=[
-            [{"type": "scatter"}, {"type": "bar"}],
-            [{"type": "scatter"}, {"type": "scatter"}],
-            [{"type": "scatter"}, {"type": "scatter"}],
-            [{"type": "scatter", "colspan": 2}, None]
-        ]
+        rows=6, cols=1,
+        subplot_titles=[
+            'Time Domain',
+            'Power Spectral Density',
+            'Band Powers by Channel',
+            'Bandpower Ratios by Channel',
+            'Time-varying Bandpowers',
+            'Time-varying Ratios'
+        ],
+        vertical_spacing=0.08,
+        row_heights=[0.2, 0.2, 0.15, 0.15, 0.15, 0.15]
     )
     
-    # Get time points
-    times = processed_data[0]['buffer_data']['times']
-    
-    # 1. Beta Power in Frontal/Central channels
-    for ch_name in ['Fz', 'C3', 'Cz', 'C4']:
-        ch_idx = ELECTRODES[ch_name]
+    # Plot 1: Time domain
+    for ch_idx, ch_data in processed_data.items():
         fig.add_trace(
             go.Scatter(
-                x=times,
-                y=processed_data[ch_idx]['buffer_data']['powers']['beta_mid'],
-                name=f'Beta {ch_name}',
-                mode='lines'
+                x=ch_data['time'],
+                y=ch_data['filtered'],
+                name=f'{channel_labels[ch_idx]}',
+                line=dict(dash='solid')
             ),
             row=1, col=1
         )
     
-    # 2. Emotion Probabilities
-    emotions = []
-    probabilities = []
-    for t_idx in range(len(times)):
-        # Get data window centered at current time
-        emotion, scores = classify_emotional_state(
-            {ch: {'powers': {
-                band: powers[t_idx] 
-                for band, powers in ch_data['buffer_data']['powers'].items()
-            }} for ch, ch_data in processed_data.items()}
-        )
-        emotions.append(emotion)
-        probabilities.append(scores)
-    
-    # Plot emotion probabilities
-    for emotion in ['excited', 'angry', 'sad', 'calm']:
-        fig.add_trace(
-            go.Bar(
-                name=emotion.capitalize(),
-                x=[emotion],
-                y=[np.mean([p[emotion] for p in probabilities])]
-            ),
-            row=1, col=2
-        )
-    
-    # 3. Alpha Asymmetry
-    left_alpha = processed_data[ELECTRODES['PO7']]['buffer_data']['powers']['alpha']
-    right_alpha = processed_data[ELECTRODES['PO8']]['buffer_data']['powers']['alpha']
-    fig.add_trace(
-        go.Scatter(
-            x=times,
-            y=np.log(right_alpha) - np.log(left_alpha),
-            name='Alpha Asymmetry'
-        ),
-        row=2, col=1
-    )
-    
-    # 4. Beta Asymmetry
-    left_beta = processed_data[ELECTRODES['C3']]['buffer_data']['powers']['beta_mid']
-    right_beta = processed_data[ELECTRODES['C4']]['buffer_data']['powers']['beta_mid']
-    fig.add_trace(
-        go.Scatter(
-            x=times,
-            y=np.log(right_beta) - np.log(left_beta),
-            name='Beta Asymmetry'
-        ),
-        row=2, col=2
-    )
-    
-    # 5. Time-varying Band Powers
-    for band in FREQ_BANDS:
+    # Plot 2: PSD
+    for ch_idx, ch_data in processed_data.items():
         fig.add_trace(
             go.Scatter(
-                x=times,
-                y=np.mean([ch_data['buffer_data']['powers'][band] 
-                          for ch_data in processed_data.values()], axis=0),
-                name=f'{band} Power'
+                x=ch_data['freqs'],
+                y=ch_data['psd'],
+                name=channel_labels[ch_idx]
+            ),
+            row=2, col=1
+        )
+    
+    # Plot 3: Band powers by channel
+    channels = list(file_processed_data.keys())
+    for band in FREQ_BANDS:
+        powers = [file_processed_data[ch]['powers'][band] for ch in channels]
+        fig.add_trace(
+            go.Bar(
+                name=band,
+                x=[channel_labels[ch] for ch in channels],
+                y=powers
             ),
             row=3, col=1
         )
     
-    # 6. Motion Artifacts
-    acc_data = processed_data[8:11]['raw']  # Channels 9-11
-    gyr_data = processed_data[11:14]['raw']  # Channels 12-14
-    artifacts = detect_artifacts(acc_data, gyr_data)
-    fig.add_trace(
-        go.Scatter(
-            x=times,
-            y=artifacts.astype(int),
-            name='Clean Signal',
-            mode='lines'
-        ),
-        row=3, col=2
-    )
+    # Plot 4: Power ratios by channel
+    ratio_names = [
+        'power_ratio_index',
+        'delta_alpha_ratio',
+        'theta_alpha_ratio',
+        'theta_beta_ratio',
+        'theta_beta_alpha_ratio',
+        'engagement_index'
+    ]
     
-    # 7. Emotion State Transitions
-    fig.add_trace(
-        go.Scatter(
-            x=times,
-            y=emotions,
-            name='Emotional State',
-            mode='lines+markers'
-        ),
-        row=4, col=1
-    )
-    
-    # Update layout
-    fig.update_layout(
-        height=1200,
-        showlegend=True,
-        title_text=f"Emotional State Analysis (Window: {window_params['duration']}s)"
-    )
-    
-    return fig
-
-def calculate_auto_quantization_thresholds(all_processed_data, emotion_files):
-    """Calculate automatic quantization thresholds from baseline data.
-    
-    Args:
-        all_processed_data (dict): Processed data from all files
-        emotion_files (dict): Mapping of emotion labels to filenames
-        
-    Returns:
-        dict: Quantization thresholds for each feature and emotion
-    """
-    # Initialize storage for feature distributions
-    feature_stats = {
-        'beta_frontal': [],    # Frontal beta (Fz, C3, Cz, C4)
-        'alpha_left': [],      # Left alpha (PO7)
-        'alpha_right': [],     # Right alpha (PO8)
-        'beta_right': [],      # Right beta (C4)
-        'alpha_total': [],     # Total alpha (PO7, Oz, PO8)
-        'beta_total': []       # Total beta (all channels)
-    }
-    
-    # Collect features across all files
-    for file_name, file_data in all_processed_data.items():
-        # Beta frontal
-        beta_frontal = np.mean([
-            file_data[ELECTRODES[ch]]['powers']['beta_mid']
-            for ch in ['Fz', 'C3', 'Cz', 'C4']
-        ])
-        feature_stats['beta_frontal'].append(beta_frontal)
-        
-        # Alpha left/right
-        feature_stats['alpha_left'].append(
-            file_data[ELECTRODES['PO7']]['powers']['alpha']
-        )
-        feature_stats['alpha_right'].append(
-            file_data[ELECTRODES['PO8']]['powers']['alpha']
-        )
-        
-        # Right beta (C4)
-        feature_stats['beta_right'].append(
-            file_data[ELECTRODES['C4']]['powers']['beta_mid']
-        )
-        
-        # Total alpha/beta
-        feature_stats['alpha_total'].append(np.mean([
-            file_data[ELECTRODES[ch]]['powers']['alpha']
-            for ch in ['PO7', 'Oz', 'PO8']
-        ]))
-        feature_stats['beta_total'].append(np.mean([
-            file_data[ch]['powers']['beta_mid']
-            for ch in range(NUM_CHANNELS)
-        ]))
-    
-    # Calculate statistics
-    stats = {}
-    for feature, values in feature_stats.items():
-        values = np.array(values)
-        stats[feature] = {
-            'mean': np.mean(values),
-            'std': np.std(values),
-            'q25': np.percentile(values, 25),
-            'q50': np.percentile(values, 50),
-            'q75': np.percentile(values, 75)
-        }
-    
-    # Calculate emotion-specific thresholds
-    thresholds = {
-        'excited': {
-            'beta_high': stats['beta_total']['q75'],
-            'alpha_low': stats['alpha_total']['q25']
-        },
-        'angry': {
-            'beta_right_high': stats['beta_right']['q75'],
-            'beta_asymmetry': stats['beta_right']['q75'] - stats['beta_frontal']['q50']
-        },
-        'sad': {
-            'alpha_right_high': stats['alpha_right']['q75'],
-            'arousal_low': stats['beta_total']['q25']
-        },
-        'calm': {
-            'alpha_left_high': stats['alpha_left']['q75'],
-            'beta_low': stats['beta_total']['q25']
-        }
-    }
-    
-    return thresholds
-
-def apply_emotion_thresholds(features, thresholds):
-    """Apply auto-quantized thresholds to classify emotional state.
-    
-    Args:
-        features (dict): Extracted EEG features
-        thresholds (dict): Auto-quantized thresholds
-        
-    Returns:
-        tuple: (emotion, confidence_scores)
-    """
-    scores = {
-        'excited': 0.0,
-        'angry': 0.0,
-        'sad': 0.0,
-        'calm': 0.0
-    }
-    
-    # Excited: High beta, low alpha
-    if features['beta_total'] > thresholds['excited']['beta_high']:
-        scores['excited'] += 0.5
-    if features['alpha_total'] < thresholds['excited']['alpha_low']:
-        scores['excited'] += 0.5
-        
-    # Angry: High right beta, beta asymmetry
-    if features['beta_right'] > thresholds['angry']['beta_right_high']:
-        scores['angry'] += 0.6
-    if features['beta_asymmetry'] > thresholds['angry']['beta_asymmetry']:
-        scores['angry'] += 0.4
-        
-    # Sad: High right alpha, low arousal
-    if features['alpha_right'] > thresholds['sad']['alpha_right_high']:
-        scores['sad'] += 0.7
-    if features['beta_total'] < thresholds['sad']['arousal_low']:
-        scores['sad'] += 0.3
-        
-    # Calm: High left alpha, low beta
-    if features['alpha_left'] > thresholds['calm']['alpha_left_high']:
-        scores['calm'] += 0.6
-    if features['beta_total'] < thresholds['calm']['beta_low']:
-        scores['calm'] += 0.4
-    
-    # Normalize scores
-    total = sum(scores.values()) + 1e-6
-    scores = {k: v/total for k, v in scores.items()}
-    
-    # Get highest scoring emotion
-    emotion = max(scores.items(), key=lambda x: x[1])[0]
-    
-    return emotion, scores
-
-def detect_sample_boundaries(data, fs, expected_duration=200):
-    """Detect start and end points of the actual response in a sample.
-    
-    Args:
-        data: Raw EEG data
-        fs: Sampling frequency
-        expected_duration: Expected duration in seconds (default 200s = 3:20)
-        
-    Returns:
-        tuple: (start_idx, end_idx, confidence_score)
-    """
-    # Convert data to energy envelope
-    window_size = int(0.5 * fs)  # 500ms window
-    energy = np.convolve(data**2, np.ones(window_size)/window_size, mode='valid')
-    
-    # Find baseline noise level
-    noise_level = np.percentile(energy, 10)
-    
-    # Find signal onset (when energy exceeds 2x noise level)
-    onset_candidates = np.where(energy > 2 * noise_level)[0]
-    if len(onset_candidates) == 0:
-        return 0, len(data), 0.0
-    
-    start_idx = onset_candidates[0]
-    expected_samples = int(expected_duration * fs)
-    end_idx = min(start_idx + expected_samples, len(data))
-    
-    # Calculate confidence score based on signal-to-noise ratio
-    signal_level = np.mean(energy[start_idx:end_idx])
-    confidence = 1.0 - (noise_level / signal_level)
-    
-    return start_idx, end_idx, confidence
-
-def normalize_sample_timing(processed_data, fs, target_duration=200):
-    """Normalize sample timing to match target duration.
-    
-    Args:
-        processed_data: Dictionary of processed channel data
-        fs: Sampling frequency
-        target_duration: Target duration in seconds
-        
-    Returns:
-        dict: Processed data with normalized timing
-    """
-    # Find start/end points across all EEG channels
-    start_points = []
-    end_points = []
-    for ch in range(NUM_CHANNELS):
-        start, end, conf = detect_sample_boundaries(
-            processed_data[ch]['raw'], fs)
-        if conf > 0.5:  # Only use confident detections
-            start_points.append(start)
-            end_points.append(end)
-    
-    # Use median start/end points for robustness
-    start_idx = int(np.median(start_points)) if start_points else 0
-    end_idx = int(np.median(end_points)) if end_points else len(processed_data[0]['raw'])
-    
-    # Store timing information
-    timing_info = {
-        'start_sample': start_idx,
-        'end_sample': end_idx,
-        'start_time': start_idx / fs,
-        'end_time': end_idx / fs,
-        'duration': (end_idx - start_idx) / fs
-    }
-    
-    # Update all channel data
-    for ch in processed_data:
-        processed_data[ch]['timing'] = timing_info
-        
-    return processed_data
-
-def save_frequency_domain_representation(processed_data, file_name, output_dir):
-    fig = go.Figure()
-
-    for ch_idx, ch_data in processed_data.items():
-        freqs, psd = compute_psd(ch_data['filtered'], ch_data['sampling_rate'])
-        fig.add_trace(go.Scatter(x=freqs, y=psd, name=f"Channel {ch_idx}"))
-
-    fig.update_layout(
-        title=f"Frequency Domain Representation - {file_name}",
-        xaxis_title="Frequency (Hz)",
-        yaxis_title="Power Spectral Density",
-        height=600
-    )
-
-    output_path = os.path.join(output_dir, f"{file_name}_frequency_domain.html")
-    fig.write_html(output_path)
-    print(f"Frequency domain representation saved to {output_path}")
-
-def save_emotion_matrix_visualization(emotion_matrix, file_names, output_dir):
-    emotion_matrix = np.array(emotion_matrix)
-    emotions = ['Excited', 'Angry', 'Sad', 'Calm']
-
-    fig = go.Figure(data=go.Heatmap(
-        z=emotion_matrix,
-        x=emotions,
-        y=file_names,
-        colorscale='Viridis'
-    ))
-
-    fig.update_layout(
-        title="Emotion Classification Matrix",
-        xaxis_title="Emotions",
-        yaxis_title="Files",
-        height=600
-    )
-
-    output_path = os.path.join(output_dir, "emotion_matrix.html")
-    fig.write_html(output_path)
-    print(f"Emotion matrix visualization saved to {output_path}")
-
-def plot_valence_arousal_space(valence, arousal, times):
-    """Create a 2D scatter plot for valence-arousal space with a time gradient."""
-    fig = go.Figure()
-
-    # Scatter plot with time gradient
-    fig.add_trace(
-        go.Scatter(
-            x=valence,
-            y=arousal,
-            mode='markers',
-            marker=dict(
-                size=8,
-                color=times,
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title="Time (s)")
+    for ch_idx in channels:
+        ratios = [file_processed_data[ch_idx]['power_ratios'][ratio] for ratio in ratio_names]
+        fig.add_trace(
+            go.Bar(
+                name=channel_labels[ch_idx],
+                x=ratio_names,
+                y=ratios
             ),
-            name="Valence-Arousal"
+            row=4, col=1
         )
-    )
-
+    
+    # Plot 5: Time-varying bandpowers
+    ref_channel = channels[0]  # Use first channel as reference
+    buffer_times = file_processed_data[ref_channel]['buffer_data']['times']
+    
+    for band in FREQ_BANDS:
+        fig.add_trace(
+            go.Scatter(
+                x=buffer_times,
+                y=file_processed_data[ref_channel]['buffer_data']['powers'][band],
+                name=f'{band} power',
+                mode='lines'
+            ),
+            row=5, col=1
+        )
+    
+    # Plot 6: Time-varying ratios
+    for ratio in ratio_names:
+        fig.add_trace(
+            go.Scatter(
+                x=buffer_times,
+                y=file_processed_data[ref_channel]['buffer_data']['ratios'][ratio],
+                name=ratio,
+                mode='lines'
+            ),
+            row=6, col=1
+        )
+    
     # Update layout
     fig.update_layout(
-        title="Valence-Arousal Space",
-        xaxis_title="Valence",
-        yaxis_title="Arousal",
-        height=600,
-        showlegend=False
+        height=1800,
+        showlegend=True,
+        legend=dict(x=1.1, y=1),
+        title_text="EEG Analysis with Bandpower Ratios"
     )
+    
+    # Update axes labels
+    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
+    fig.update_yaxes(title_text="Amplitude", row=1, col=1)
+    fig.update_xaxes(title_text="Frequency (Hz)", row=2, col=1)
+    fig.update_xaxes(title_text="Channel", row=3, col=1)
+    fig.update_yaxes(title_text="Power", row=3, col=1)
+    fig.update_xaxes(title_text="Ratio Type", row=4, col=1)
+    fig.update_yaxes(title_text="Ratio Value", row=4, col=1)
+    fig.update_xaxes(title_text="Time (s)", row=5, col=1)
+    fig.update_yaxes(title_text="Power", row=5, col=1)
+    fig.update_xaxes(title_text="Time (s)", row=6, col=1)
+    fig.update_yaxes(title_text="Ratio Value", row=6, col=1)
+    
     return fig
+
+# --- Dual-mode SVM feature extraction and classification ---
+SELECTED_ELECTRODE_INDICES = [ELECTRODES[ch] for ch in ['Fz', 'C3', 'C4', 'PO7', 'PO8']]
+ALL_CHANNEL_INDICES = list(range(NUM_CHANNELS))
+
+# Feature extraction for selected electrodes
+def extract_features_selected(processed_data):
+    """Extract features from selected channels (Fz, C3, C4, PO7, PO8) for SVM."""
+    sel_indices = [ELECTRODES['Fz'], ELECTRODES['C3'], ELECTRODES['C4'], ELECTRODES['PO7'], ELECTRODES['PO8']]
+    features = []
+    for ch in sel_indices:
+        ch_data = processed_data.get(ch, {})
+        for band in FREQ_BANDS:
+            features.append(ch_data.get('powers', {}).get(band, 0))
+        for ratio in [
+            'power_ratio_index',
+            'delta_alpha_ratio',
+            'theta_alpha_ratio',
+            'theta_beta_ratio',
+            'theta_beta_alpha_ratio',
+            'engagement_index']:
+            features.append(ch_data.get('power_ratios', {}).get(ratio, 0))
+    return np.array(features)
+
+# Feature extraction for all 8 channels
+def extract_features_allch(processed_data):
+    """Extract features from all 8 EEG channels for SVM."""
+    features = []
+    for ch in range(NUM_CHANNELS):
+        ch_data = processed_data.get(ch, {})
+        for band in FREQ_BANDS:
+            features.append(ch_data.get('powers', {}).get(band, 0))
+        for ratio in [
+            'power_ratio_index',
+            'delta_alpha_ratio',
+            'theta_alpha_ratio',
+            'theta_beta_ratio',
+            'theta_beta_alpha_ratio',
+            'engagement_index']:
+            features.append(ch_data.get('power_ratios', {}).get(ratio, 0))
+    return np.array(features)
+
+# Helper to get model/scaler paths for each mode
+def get_model_paths(mode):
+    suffix = '_allch' if mode == 'allch' else '_selch'
+    svm_path = os.path.join('output', 'combined', f'svm_model{suffix}.joblib')
+    scaler_path = os.path.join('output', 'combined', f'scaler{suffix}.joblib')
+    return svm_path, scaler_path
+
+# Train and save SVM/scaler for a given mode
+# (Assumes X, y are already prepared for the mode)
+def train_and_save_svm(X, y, mode):
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    svm = SVC(kernel='rbf', probability=True)
+    svm.fit(X_scaled, y)
+    svm_path, scaler_path = get_model_paths(mode)
+    joblib.dump(svm, svm_path)
+    joblib.dump(scaler, scaler_path)
+    print(f"[INFO] Trained and saved SVM/scaler for mode {mode}.")
+
+def train_advanced_svm(X, y, mode, feature_names=None, plot_dir='reports'):
+    """
+    Train SVM with SMOTE, RFE feature selection, and GridSearchCV hyperparameter tuning.
+    Plots ROC and confusion matrix, saves to 'reports/'.
+    Returns best estimator, scaler, and selected features.
+    """
+    os.makedirs(plot_dir, exist_ok=True)
+    # 1. Balance classes with SMOTE
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X, y)
+    # 2. Feature scaling
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_res)
+    # 3. Feature selection with RFE (using SVM as estimator)
+    base_svm = SVC(kernel='linear', probability=True, random_state=42)
+    n_features = min(10, X_scaled.shape[1])
+    rfe = RFE(base_svm, n_features_to_select=n_features)
+    X_rfe = rfe.fit_transform(X_scaled, y_res)
+    selected_features = rfe.get_support(indices=True)
+    if feature_names is not None:
+        selected_feature_names = [feature_names[i] for i in selected_features]
+    else:
+        selected_feature_names = selected_features
+    # 4. Hyperparameter tuning with GridSearchCV
+    param_grid = {
+        'C': [0.1, 1, 10],
+        'gamma': ['scale', 0.01, 0.1, 1],
+        'kernel': ['rbf']
+    }
+    grid = GridSearchCV(SVC(probability=True), param_grid, cv=5, scoring='balanced_accuracy')
+    grid.fit(X_rfe, y_res)
+    best_svm = grid.best_estimator_
+    # 5. Evaluation (train/test split for reporting)
+    X_train, X_test, y_train, y_test = train_test_split(X_rfe, y_res, test_size=0.2, random_state=42, stratify=y_res)
+    best_svm.fit(X_train, y_train)
+    y_pred = best_svm.predict(X_test)
+    y_proba = best_svm.predict_proba(X_test)
+    # 6. Confusion matrix
+    fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+    ConfusionMatrixDisplay.from_estimator(best_svm, X_test, y_test, ax=ax_cm, cmap='Blues')
+    plt.title(f'Confusion Matrix ({mode})')
+    cm_path = os.path.join(plot_dir, f'confusion_matrix_{mode}.pdf')
+    fig_cm.savefig(cm_path)
+    plt.close(fig_cm)
+    # 7. ROC curve (one-vs-rest)
+    if len(np.unique(y_test)) > 1:
+        fig_roc, ax_roc = plt.subplots(figsize=(6, 5))
+        RocCurveDisplay.from_estimator(best_svm, X_test, y_test, ax=ax_roc)
+        plt.title(f'ROC Curve ({mode})')
+        roc_path = os.path.join(plot_dir, f'roc_curve_{mode}.pdf')
+        fig_roc.savefig(roc_path)
+        plt.close(fig_roc)
+    else:
+        roc_path = None
+    # 8. Save model and scaler
+    svm_path, scaler_path = get_model_paths(mode)
+    joblib.dump(best_svm, svm_path)
+    joblib.dump(scaler, scaler_path)
+    print(f"[INFO] Trained and saved SVM/scaler for mode {mode}.")
+    print(f"[INFO] Confusion matrix saved to {cm_path}")
+    if roc_path:
+        print(f"[INFO] ROC curve saved to {roc_path}")
+    return best_svm, scaler, selected_feature_names
+
+
+def perform_anova_on_bandpowers(X, y, feature_names=None, report_dir='reports', mode='allch'):
+    """
+    Perform ANOVA for each feature across emotion classes. Save results to PDF in 'reports/'.
+    """
+    os.makedirs(report_dir, exist_ok=True)
+    results = []
+    for i in range(X.shape[1]):
+        groups = [X[y == label, i] for label in np.unique(y)]
+        fval, pval = stats.f_oneway(*groups)
+        fname = feature_names[i] if feature_names is not None else f'feature_{i}'
+        results.append((fname, fval, pval))
+    # Save to PDF
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font('Arial', 'B', 12)
+    pdf.cell(0, 10, f'ANOVA Results ({mode})', ln=1)
+    pdf.set_font('Arial', '', 10)
+    pdf.cell(0, 10, 'Feature\tF-value\tp-value', ln=1)
+    for fname, fval, pval in results:
+        pdf.cell(0, 10, f'{fname}\t{fval:.3f}\t{pval:.3e}', ln=1)
+    pdf_path = os.path.join(report_dir, f'anova_results_{mode}.pdf')
+    pdf.output(pdf_path)
+    print(f"[INFO] ANOVA results saved to {pdf_path}")
+    return results
+
+
+def calculate_asymmetry_indices(processed_data):
+    """
+    Calculate alpha asymmetry indices for C3-C4 and PO7-PO8.
+    Returns a dict with asymmetry values. Skips pairs if channel data is missing.
+    """
+    indices = {}
+    # C3 (1) vs C4 (3), PO7 (5) vs PO8 (7)
+    for (left, right, label) in [(1, 3, 'C3-C4'), (5, 7, 'PO7-PO8')]:
+        if left in processed_data and right in processed_data:
+            left_data = processed_data[left]['filtered']
+            right_data = processed_data[right]['filtered']
+            fs = processed_data[left]['sampling_rate']
+            asym = calculate_alpha_asymmetry(left_data, right_data, fs)
+            indices[label] = asym
+        else:
+            indices[label] = None  # Mark as missing
+    return indices
+
+# --- Methodology clarification ---
+# The pipeline now includes:
+# - Class balancing with SMOTE
+# - Feature selection with RFE
+# - SVM hyperparameter tuning with GridSearchCV
+# - Statistical validation with ANOVA
+# - ROC/confusion matrix and asymmetry index reporting
+# - All PDF reports saved to 'reports/'
+# - Expanded docstrings and comments for clarity
+
+def label_emotion_window(buffer_powers, electrodes=ELECTRODES, thresholds=EMOTION_THRESHOLDS):
+    """Label a single window based on neurophysiological EEG emotion rules."""
+    # Extract relevant band powers
+    beta_fz = buffer_powers[electrodes['Fz']]['beta_low'] + buffer_powers[electrodes['Fz']]['beta_mid']
+    beta_cz = buffer_powers[electrodes['Cz']]['beta_low'] + buffer_powers[electrodes['Cz']]['beta_mid']
+    beta_c3 = buffer_powers[electrodes['C3']]['beta_low'] + buffer_powers[electrodes['C3']]['beta_mid']
+    beta_c4 = buffer_powers[electrodes['C4']]['beta_low'] + buffer_powers[electrodes['C4']]['beta_mid']
+    alpha_po7 = buffer_powers[electrodes['PO7']]['alpha']
+    alpha_po8 = buffer_powers[electrodes['PO8']]['alpha']
+    alpha_oz = buffer_powers[electrodes['Oz']]['alpha']
+    # Excited: High frontal/central beta, low posterior alpha
+    if (beta_fz > thresholds['beta_high'] or beta_cz > thresholds['beta_high'] or beta_c3 > thresholds['beta_high'] or beta_c4 > thresholds['beta_high']) and \
+       (alpha_po7 < thresholds['alpha_low'] and alpha_po8 < thresholds['alpha_low'] and alpha_oz < thresholds['alpha_low']):
+        return 'excited'
+    # Angry: High right beta or beta asymmetry
+    if (beta_c4 > thresholds['beta_high']) or (beta_c4 / (beta_c3 + 1e-6) > thresholds['beta_asymmetry']):
+        return 'angry'
+    # Sad: High right posterior alpha
+    if alpha_po8 > thresholds['alpha_low']:
+        return 'sad'
+    # Calm: High left posterior alpha
+    if alpha_po7 > thresholds['alpha_low']:
+        return 'calm'
+    return 'unknown'
+
+def label_emotion_window_rule_based(window_band_powers):
+    """
+    Classify a window as Excited, Angry, Sad, or Calm based on band powers and neurophysiological rules.
+    Args:
+        window_band_powers (dict): {ch_idx: {band: value, ...}, ...} for this window
+    Returns:
+        str: One of 'Excited', 'Angry', 'Sad', 'Calm'
+    """
+    # Channel indices for relevant electrodes
+    Fz, C3, Cz, C4, PO7, Oz, PO8 = 0, 1, 2, 3, 5, 6, 7
+    # 1. Excited: High Beta (Fz, C3, Cz, C4), Low Alpha (PO7, Oz, PO8)
+    beta_frontal = np.mean([
+        window_band_powers.get(ch, {}).get('beta_low', 0) + window_band_powers.get(ch, {}).get('beta_mid', 0)
+        for ch in [Fz, C3, Cz, C4]
+    ])
+    alpha_posterior = np.mean([
+        window_band_powers.get(ch, {}).get('alpha', 0)
+        for ch in [PO7, Oz, PO8]
+    ])
+    # 2. Angry: High Beta at C4 (right central)
+    beta_c4 = window_band_powers.get(C4, {}).get('beta_low', 0) + window_band_powers.get(C4, {}).get('beta_mid', 0)
+    # 3. Sad: High Alpha at PO8 (right posterior)
+    alpha_po8 = window_band_powers.get(PO8, {}).get('alpha', 0)
+    # 4. Calm: High Alpha at PO7 (left posterior)
+    alpha_po7 = window_band_powers.get(PO7, {}).get('alpha', 0)
+    # --- Thresholds (relative, not absolute) ---
+    # Compute z-scores for each metric within this window (relative to all 4 metrics)
+    metrics = np.array([beta_frontal, beta_c4, alpha_po8, alpha_po7])
+    zscores = (metrics - np.mean(metrics)) / (np.std(metrics) + 1e-6)
+    # Assign emotion based on which metric is highest (z-score)
+    idx = np.argmax(zscores)
+    if idx == 0:
+        # Excited: beta_frontal highest
+        return 'Excited'
+    elif idx == 1:
+        return 'Angry'
+    elif idx == 2:
+        return 'Sad'
+    elif idx == 3:
+        return 'Calm'
+    else:
+        return 'Unknown'
+
+def compute_stft(data, fs, nperseg=256, noverlap=None):
+    """Compute Short-Time Fourier Transform."""
+    if noverlap is None:
+        noverlap = nperseg // 2
+    f, t, Zxx = stft(data, fs=fs, nperseg=nperseg, noverlap=noverlap)
+    return f, t, np.abs(Zxx)
+
+def compute_wavelet(data, fs, wavelet_width=5.0):
+    """Compute Wavelet Transform using continuous wavelet transform."""
+    # Use Morlet wavelet for analysis
+    scales = np.arange(1, 128)
+    frequencies = fs / (scales * wavelet_width)
+    coef = cwt(data, morlet2, scales, w=wavelet_width)
+    return frequencies, np.abs(coef)
 
 def smooth_emotional_state(processed_data, sampling_rate, smoothing_rate=5):
     smoothed_states = []
@@ -1755,59 +1345,392 @@ def smooth_emotional_state(processed_data, sampling_rate, smoothing_rate=5):
 
     return smoothed_states, time_points
 
-def generate_pdf_report(output_dir, emotion_matrix, file_names, valence_arousal_data):
-    """Generate a PDF report summarizing the classification results and interpretations."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
+def generate_pdf_report(
+    output_dir, emotion_matrix, file_names, valence_arousal_data, png_paths=None, baseline_file=None, settings=None, steps_description=None, results_summary=None,
+    all_processed_data=None, classification_results=None, visualizations=None, timestamp=None,
+    eda_processed_data=None
+):
+    """
+    Generate a comprehensive PDF report including:
+    - Sample/data summary
+    - Classification results (confusion matrix, ROC, etc.)
+    - Statistical summaries (ANOVA, asymmetry indices)
+    - All relevant visualizations
+    - Methodology and settings
+    - Statistical feature tables/plots for EEG/EDA
+    The report is always saved to the 'reports/' directory.
+    """
+    from matplotlib.backends.backend_pdf import PdfPages
+    from fpdf import FPDF
+    import matplotlib.pyplot as plt
+    import numpy as np
 
-    # Title
-    pdf.set_font("Arial", style="B", size=16)
-    pdf.cell(200, 10, txt="EEG Emotion Classification Report", ln=True, align="C")
-    pdf.ln(10)
+    # Ensure reports directory exists
+    reports_dir = os.path.join(os.path.dirname(output_dir), 'reports')
+    os.makedirs(reports_dir, exist_ok=True)
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    pdf_path = os.path.join(reports_dir, f'analysis_report_{timestamp}.pdf')
 
-    # Summary of Results
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt="Summary of Classification Results:", ln=True)
-    pdf.ln(5)
+    with PdfPages(pdf_path) as pdf:
+        # 1. Title and metadata page
+        plt.figure(figsize=(8.5, 11))
+        plt.axis('off')
+        plt.title('EEG Emotion Analysis Report', fontsize=20, pad=40)
+        plt.text(0.1, 0.8, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", fontsize=12)
+        if settings:
+            plt.text(0.1, 0.7, f"Settings: {settings}", fontsize=10)
+        if steps_description:
+            plt.text(0.1, 0.6, f"Pipeline Steps: {steps_description}", fontsize=10)
+        plt.text(0.1, 0.5, f"Files analyzed: {', '.join(file_names)}", fontsize=10)
+        plt.text(0.1, 0.4, f"Baseline: {baseline_file}", fontsize=10)
+        plt.text(0.1, 0.3, f"Report location: {pdf_path}", fontsize=8)
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
 
-    emotions = ['Excited', 'Angry', 'Sad', 'Calm']
-    for i, file_name in enumerate(file_names):
-        pdf.cell(200, 10, txt=f"File: {file_name}", ln=True)
-        for j, emotion in enumerate(emotions):
-            pdf.cell(200, 10, txt=f"  {emotion}: {emotion_matrix[i][j]:.2f}", ln=True)
-        pdf.ln(5)
+        # 2. Data/sample summary
+        if all_processed_data:
+            plt.figure(figsize=(8, 4))
+            plt.axis('off')
+            plt.title('Sample/Data Summary', fontsize=14)
+            lines = []
+            for fname, pdata in all_processed_data.items():
+                n_ch = len(pdata)
+                n_samples = len(next(iter(pdata.values()))['filtered']) if n_ch > 0 else 0
+                lines.append(f"{fname}: {n_ch} channels, {n_samples} samples/channel")
+            plt.text(0.1, 0.8, '\n'.join(lines), fontsize=10)
+            pdf.savefig()
+            plt.close()
 
-    # Interpretation
-    pdf.set_font("Arial", style="B", size=14)
-    pdf.cell(200, 10, txt="Interpretation of Results:", ln=True)
-    pdf.ln(5)
-    pdf.set_font("Arial", size=12)
-    pdf.multi_cell(0, 10, txt=(
-        "The classification results provide insights into the cognitive and emotional states of the participants. "
-        "For example:\n"
-        "- High 'Excited' scores indicate increased beta activity in frontal and central regions, suggesting heightened "
-        "engagement or alertness.\n"
-        "- High 'Calm' scores are associated with increased alpha activity in posterior regions, reflecting relaxation.\n"
-        "- 'Angry' scores are linked to increased beta activity in the right frontal region, indicating emotional tension.\n"
-        "- 'Sad' scores are associated with increased alpha activity in the right posterior region, reflecting withdrawal or low arousal."
-    ))
-    pdf.ln(10)
+        # 3. Classification results
+        if classification_results:
+            plt.figure(figsize=(8, 4))
+            plt.axis('off')
+            plt.title('Classification Results', fontsize=14)
+            for mode, res in classification_results.items():
+                plt.text(0.1, 0.8 - 0.1*list(classification_results.keys()).index(mode), f"{mode}: {res}", fontsize=10)
+            pdf.savefig()
+            plt.close()
 
-    # Valence-Arousal Analysis
-    pdf.set_font("Arial", style="B", size=14)
-    pdf.cell(200, 10, txt="Valence-Arousal Analysis:", ln=True)
-    pdf.ln(5)
-    pdf.set_font("Arial", size=12)
-    pdf.multi_cell(0, 10, txt=(
-        "The valence-arousal space provides a 2D representation of emotional states over time. "
-        "Valence reflects the positivity or negativity of the emotional state, while arousal reflects the level of activation. "
-        "The scatter plot shows the distribution of emotional states across these dimensions."
-    ))
-    pdf.ln(10)
+        # 4. Statistical summaries (ANOVA, asymmetry)
+        if results_summary:
+            plt.figure(figsize=(8, 4))
+            plt.axis('off')
+            plt.title('Statistical Results', fontsize=14)
+            plt.text(0.1, 0.8, results_summary, fontsize=10)
+            pdf.savefig()
+            plt.close()
 
-    # Save PDF
-    pdf_output_path = os.path.join(output_dir, "EEG_Emotion_Classification_Report.pdf")
-    pdf.output(pdf_output_path)
-    print(f"PDF report saved to {pdf_output_path}")
+        # 5. EEG Statistical feature tables/plots
+        if all_processed_data:
+            for fname, pdata in all_processed_data.items():
+                for ch_idx, ch_data in pdata.items():
+                    stat_features = ch_data.get('stat_features', [])
+                    if stat_features:
+                        # Plot each feature over windows
+                        win_times = np.arange(len(stat_features)) * 2.0  # 2s window
+                        for feat in ['mean', 'std', 'min', 'max', 'rms', 'skewness', 'kurtosis', 'moving_average']:
+                            values = [f[feat] for f in stat_features if feat in f]
+                            if len(values) > 0:
+                                plt.figure(figsize=(8, 2))
+                                plt.plot(win_times[:len(values)], values, label=feat)
+                                plt.title(f'{fname} - {channel_labels[ch_idx]} - {feat}')
+                                plt.xlabel('Time (s)')
+                                plt.ylabel(feat)
+                                plt.tight_layout()
+                                pdf.savefig()
+                                plt.close()
+
+        # 6. EDA statistical features and decomposition (if provided)
+        if eda_processed_data:
+            for fname, eda_dict in eda_processed_data.items():
+                for key in ['raw', 'tonic', 'phasic']:
+                    stat_features = eda_dict['features'].get(key, [])
+                    if stat_features:
+                        win_times = np.arange(len(stat_features)) * 2.0
+                        for feat in ['mean', 'std', 'min', 'max', 'rms', 'skewness', 'kurtosis', 'moving_average']:
+                            values = [f[feat] for f in stat_features if feat in f]
+                            if len(values) > 0:
+                                plt.figure(figsize=(8, 2))
+                                plt.plot(win_times[:len(values)], values, label=feat)
+                                plt.title(f'{fname} - EDA {key} - {feat}')
+                                plt.xlabel('Time (s)')
+                                plt.ylabel(feat)
+                                plt.tight_layout()
+                                pdf.savefig()
+                                plt.close()
+                # EDA decomposition plot
+                if 'raw' in eda_dict and 'tonic' in eda_dict and 'phagic' in eda_dict:
+                    time = np.arange(len(eda_dict['raw'])) / 250.0
+                    plt.figure(figsize=(8, 3))
+                    plt.plot(time, eda_dict['raw'], label='Raw')
+                    plt.plot(time, eda_dict['tonic'], label='Tonic')
+                    plt.plot(time, eda_dict['phagic'], label='Phagic')
+                    plt.title(f'{fname} - EDA Decomposition')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('EDA (uS)')
+                    plt.legend()
+                    plt.tight_layout()
+                    pdf.savefig()
+                    plt.close()
+
+        # 6b. Comparative tonic/phasic plot across all files (EDA and EEG)
+        if eda_processed_data:
+            plot_tonic_phasic_comparison_all_files(eda_processed_data, all_processed_data if all_processed_data else None, pdf)
+
+        # 6c. Tonic lateralized alpha asymmetry for low-arousal states (Calm/Sad)
+        if all_processed_data:
+            plot_tonic_alpha_lateralization_low_arousal(all_processed_data, pdf)
+
+        # 7. Band power/ratio/engagement/asymmetry plots
+        if all_processed_data:
+            # Band powers
+            for fname, pdata in all_processed_data.items():
+                for ch_idx, ch_data in pdata.items():
+                    # Band powers
+                    plt.figure(figsize=(6, 2))
+                    plt.bar(list(ch_data['powers'].keys()), list(ch_data['powers'].values()))
+                    plt.title(f'{fname} - {channel_labels[ch_idx]} Band Powers')
+                    plt.tight_layout()
+                    pdf.savefig()
+                    plt.close()
+                    # Ratios
+                    plt.figure(figsize=(6, 2))
+                    plt.bar(list(ch_data['power_ratios'].keys()), list(ch_data['power_ratios'].values()))
+                    plt.title(f'{fname} - {channel_labels[ch_idx]} Power Ratios')
+                    plt.tight_layout()
+                    pdf.savefig()
+                    plt.close()
+            # Engagement index and alpha asymmetry
+            for fname, pdata in all_processed_data.items():
+                engagement = [ch_data['power_ratios'].get('engagement_index', 0) for ch_data in pdata.values()]
+                plt.figure(figsize=(6, 2))
+                plt.bar(range(len(engagement)), engagement)
+                plt.title(f'{fname} - Engagement Index (all channels)')
+                plt.tight_layout()
+                pdf.savefig()
+                plt.close()
+            # Alpha asymmetry
+            for fname, pdata in all_processed_data.items():
+                if 1 in pdata and 3 in pdata:
+                    left = pdata[1]['filtered']
+                    right = pdata[3]['filtered']
+                    fs = pdata[1]['sampling_rate']
+                    asym = calculate_alpha_asymmetry(left, right, fs)
+                    plt.figure(figsize=(6, 2))
+                    plt.bar(['C3-C4'], [asym])
+                    plt.title(f'{fname} - Alpha Asymmetry (C3-C4)')
+                    plt.tight_layout()
+                    pdf.savefig()
+                    plt.close()
+                if 5 in pdata and 7 in pdata:
+                    left = pdata[5]['filtered']
+                    right = pdata[7]['filtered']
+                    fs = pdata[5]['sampling_rate']
+                    asym = calculate_alpha_asymmetry(left, right, fs)
+                    plt.figure(figsize=(6, 2))
+                    plt.bar(['PO7-PO8'], [asym])
+                    plt.title(f'{fname} - Alpha Asymmetry (PO7-PO8)')
+                    plt.tight_layout()
+                    pdf.savefig()
+                    plt.close()
+
+        # 8. Visualizations (figures, confusion matrix, ROC, etc.)
+        if visualizations:
+            for fig in visualizations:
+                pdf.savefig(fig)
+                plt.close(fig)
+        if png_paths:
+            for png in png_paths:
+                img = plt.imread(png)
+                plt.figure(figsize=(8, 4))
+                plt.imshow(img)
+                plt.axis('off')
+                pdf.savefig()
+                plt.close()
+
+        # 9. If nothing was added, add a placeholder page
+        if not (all_processed_data or classification_results or results_summary or visualizations or png_paths or eda_processed_data):
+            plt.figure(figsize=(8, 4))
+            plt.axis('off')
+            plt.title('No data available for report.', fontsize=16)
+            pdf.savefig()
+            plt.close()
+
+    print(f"[INFO] PDF report saved to {pdf_path}")
+    return pdf_path
+
+def main():
+    import glob
+    import os
+    import datetime
+    import numpy as np
+    import pandas as pd
+
+    # Set up paths and timestamp
+    data_folder = os.path.join(script_dir, 'data', 'raw', 'eeg')
+    reports_dir = os.path.join(script_dir, 'reports')
+    os.makedirs(reports_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # 1. Collect all EEG files
+    eeg_files = glob.glob(os.path.join(data_folder, '*.csv'))
+    all_processed_data = {}
+    file_names = []
+    for eeg_file in eeg_files:
+        processed = process_eeg_data(eeg_file)
+        all_processed_data[os.path.basename(eeg_file)] = processed
+        file_names.append(os.path.basename(eeg_file))
+
+    # 2. Prepare features and labels for SVM (example: using allch mode)
+    X, y = [], []
+    for fname, pdata in all_processed_data.items():
+        # Placeholder: extract label from filename (customize as needed)
+        label = fname.split('_')[0]
+        X.append(extract_features_allch(pdata))
+        y.append(label)
+    X = np.array(X)
+    y = np.array(y)
+
+    # 3. Train advanced SVM and perform ANOVA if there is more than one class
+    classification_results = {}
+    results_summary = ''
+    if len(np.unique(y)) > 1:
+        best_svm, scaler, selected_features = train_advanced_svm(X, y, mode='allch')
+        classification_results['allch'] = f"SVM trained with {len(selected_features)} features."
+        anova_results = perform_anova_on_bandpowers(X, y, feature_names=None, report_dir=reports_dir, mode='allch')
+        results_summary += f"ANOVA performed on {X.shape[1]} features.\n"
+    else:
+        results_summary += "Not enough classes for SVM/ANOVA.\n"
+
+    # 4. Calculate asymmetry indices for each file
+    asymmetry_indices = {}
+    for fname, pdata in all_processed_data.items():
+        asymmetry_indices[fname] = calculate_asymmetry_indices(pdata)
+    results_summary += f"Alpha asymmetry indices calculated for all files.\n"
+
+    # 5. Generate PDF report (ensure all relevant data is passed)
+    generate_pdf_report(
+        output_dir=reports_dir,
+        emotion_matrix=None,
+        file_names=file_names,
+        valence_arousal_data=None,
+        png_paths=None,
+        baseline_file=None,
+        settings=f"Sampling rate: {sampling_rate}, Downsample factor: {downsample_factor}",
+        steps_description="Advanced SVM, SMOTE, RFE, ANOVA, Asymmetry, Visualization",
+        results_summary=results_summary,
+        all_processed_data=all_processed_data,
+        classification_results=classification_results,
+        visualizations=None,
+        timestamp=timestamp
+    )
+
+# --- COMPARATIVE TONIC/PHASIC VISUALIZATION ACROSS ALL FILES ---
+def plot_tonic_phasic_comparison_all_files(eda_processed_data, eeg_processed_data=None, pdf=None):
+    """
+    Plot tonic and phasic EDA components for all files on the same axes for comparison.
+    Optionally, plot EEG slow/fast band power envelopes at key electrodes to mimic tonic/phasic and lateralization.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    colors = plt.cm.tab10.colors
+    # --- EDA: Tonic and Phasic ---
+    plt.figure(figsize=(12, 6))
+    for i, (fname, eda_dict) in enumerate(eda_processed_data.items()):
+        n = len(eda_dict['tonic'])
+        t = np.arange(n) / 250.0
+        plt.plot(t, eda_dict['tonic'], label=f"{fname} tonic", color=colors[i % 10], alpha=0.7, linestyle='-')
+    plt.title('EDA Tonic Component Comparison Across Files')
+    plt.xlabel('Time (s)')
+    plt.ylabel('EDA (uS)')
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    if pdf is not None:
+        pdf.savefig()
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    for i, (fname, eda_dict) in enumerate(eda_processed_data.items()):
+        n = len(eda_dict['phagic']) if 'phagic' in eda_dict else len(eda_dict['phasic'])
+        t = np.arange(n) / 250.0
+        phasic = eda_dict.get('phagic', eda_dict.get('phasic'))
+        plt.plot(t, phasic, label=f"{fname} phasic", color=colors[i % 10], alpha=0.7, linestyle='-')
+    plt.title('EDA Phasic Component Comparison Across Files')
+    plt.xlabel('Time (s)')
+    plt.ylabel('EDA (uS)')
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    if pdf is not None:
+        pdf.savefig()
+    plt.close()
+
+    # --- EEG: Tonic/Phasic-like (slow/fast band power) at key electrodes ---
+    if eeg_processed_data is not None:
+        # Define slow (delta+theta+alpha) and fast (beta) bands
+        slow_bands = ['delta', 'theta', 'alpha']
+        fast_bands = ['beta_low', 'beta_mid']
+        # Key electrodes for lateralization: PO7 (5), PO8 (7), C3 (1), C4 (3)
+        key_electrodes = {'PO7': 5, 'PO8': 7, 'C3': 1, 'C4': 3}
+        for label, ch_idx in key_electrodes.items():
+            plt.figure(figsize=(12, 5))
+            for i, (fname, pdata) in enumerate(eeg_processed_data.items()):
+                ch_data = pdata.get(ch_idx)
+                if ch_data is None:
+                    continue
+                buffer_times = ch_data['buffer_data']['times']
+                slow_power = np.zeros_like(buffer_times)
+                fast_power = np.zeros_like(buffer_times)
+                for band in slow_bands:
+                    slow_power += ch_data['buffer_data']['powers'][band]
+                for band in fast_bands:
+                    fast_power += ch_data['buffer_data']['powers'][band]
+                plt.plot(buffer_times, slow_power, label=f"{fname} slow (tonic)", color=colors[i % 10], alpha=0.7, linestyle='-')
+                plt.plot(buffer_times, fast_power, label=f"{fname} fast (phasic)", color=colors[i % 10], alpha=0.7, linestyle='--')
+            plt.title(f'EEG Slow (Tonic) and Fast (Phasic) Band Power at {label} Across Files')
+            plt.xlabel('Time (s)')
+            plt.ylabel('Band Power (a.u.)')
+            plt.legend(fontsize=8, ncol=2)
+            plt.tight_layout()
+            if pdf is not None:
+                pdf.savefig()
+            plt.close()
+
+def plot_tonic_alpha_lateralization_low_arousal(all_processed_data, pdf=None):
+    """
+    For each file, extract tonic (mean) alpha power at PO7 (left) and PO8 (right) for windows labeled as 'Calm' or 'Sad'.
+    Compute and plot the alpha asymmetry index (right - left, log scale) grouped by emotion label.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    colors = plt.cm.Set2.colors
+    results = {'Calm': [], 'Sad': []}
+    file_labels = []
+    for fname, pdata in all_processed_data.items():
+        # Find window labels and band powers for PO7 (5) and PO8 (7)
+        ch_left = pdata.get(5, {})  # PO7
+        ch_right = pdata.get(7, {}) # PO8
+        if not ch_left or not ch_right:
+            continue
+        # Assume window labels and band powers are stored per window
+        window_labels = ch_left.get('window_labels', [])
+        alpha_left = [w.get('alpha', 0) for w in ch_left.get('window_band_powers', [])]
+        alpha_right = [w.get('alpha', 0) for w in ch_right.get('window_band_powers', [])]
+        for lbl, aL, aR in zip(window_labels, alpha_left, alpha_right):
+            if lbl in results:
+                # Tonic = mean alpha in window
+                asym = np.log(aR + 1e-6) - np.log(aL + 1e-6)
+                results[lbl].append(asym)
+        file_labels.append(fname)
+    # Plot
+    plt.figure(figsize=(8, 4))
+    data = [results['Calm'], results['Sad']]
+    plt.boxplot(data, labels=['Calm', 'Sad'], patch_artist=True, boxprops=dict(facecolor=colors[0], alpha=0.5))
+    plt.title('Tonic Lateralized Alpha Asymmetry (PO8-PO7) in Low-Arousal States')
+    plt.ylabel('Alpha Asymmetry (log right - log left)')
+    plt.xlabel('Emotion (Low Arousal)')
+    plt.grid(True, axis='y', alpha=0.3)
+    if pdf is not None:
+        pdf.savefig()
+    plt.close()

@@ -375,14 +375,14 @@ print('Starting EEG signal processing...')
 csv_files = sorted([f for f in os.listdir(data_folder) if f.endswith('.csv')])
 
 # Create PDF report
-output_pdf_path = os.path.join(output_folder, f'eeg_analysis_report_{timestamp}.pdf')
+output_pdf_path = os.path.join('reports', f'eeg_analysis_report_{timestamp}.pdf')
 with PdfPages(output_pdf_path) as pdf:
     for filename in csv_files:
         print(f'\nProcessing {filename}...')
         filepath = os.path.join(data_folder, filename)
 
         # Process data
-        processed_data = process_eeg_data(filepath, channels=list(range(8)))
+        processed_data = process_eeg_data(filepath, channels=list(range(8)), output_folder=output_folder)
 
         # Create and save visualizations
         plot_processed_data(processed_data, filename, pdf)
