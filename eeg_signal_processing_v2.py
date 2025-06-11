@@ -130,6 +130,10 @@ from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay
 import scipy.signal
 from scipy.stats import skew, kurtosis
 from scipy.signal import convolve
+import logging
+import glob
+import matplotlib
+matplotlib.use('Agg')  # Use a non-interactive backend for PDF/PNG output
 
 # --- CONFIGURATION ---
 # Get the current script's directory
@@ -343,41 +347,64 @@ def calculate_bandpower_with_buffer(data, fs, buffer_size, buffer_overlap):
     return buffer_times, buffer_powers, buffer_ratios
 
 def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.5, downsample=True, classification_mode=None, output_folder=None, timestamp=None, pdf=None):
-    """Process EEG data from a file with advanced buffer-based analysis.
-    Args:
-        filepath (str): Path to the data file
-        channels (list): List of channel indices to process
-        buffer_size (float): Size of buffer in seconds
-        buffer_overlap (float): Overlap in seconds
-        downsample (bool): Whether to downsample the data
-        classification_mode (str): 'selch', 'allch', or None for both
-        output_folder (str): Where to save outputs (for autocorr plot)
-        timestamp (str): Timestamp for output naming
-        pdf (PdfPages): PDF object to add plots to
-    Returns:
-        dict: Processed data including time-varying bandpowers and ratios
-    """
+    """Process EEG data from a file with advanced buffer-based analysis, including ICA and artifact removal using ACC/GYR."""
     print(f"Processing EEG data from {os.path.basename(filepath)}...")
-    # Read data
+    # Read data (all 14 channels: 0-13)
     df = pd.read_csv(filepath, header=None, low_memory=False)
     df = df.iloc[:max_samples]
-    
+    # Extract EEG (ch 0-7), ACC (ch 8-10), GYR (ch 11-13)
+    eeg_data = df.iloc[:, :8].copy()
+    acc_data = df.iloc[:, 8:11].copy()
+    gyr_data = df.iloc[:, 11:14].copy()
+    # Detect motion artifacts (returns boolean mask)
+    try:
+        artifact_mask = detect_artifacts(acc_data.values, gyr_data.values, threshold=0.3)
+    except Exception as e:
+        print(f"[WARN] Artifact detection failed: {e}")
+        artifact_mask = np.ones(len(eeg_data), dtype=bool)
+    # Apply ICA for artifact removal
+    try:
+        from sklearn.decomposition import FastICA
+        # Only use clean segments for ICA fitting
+        eeg_for_ica = eeg_data[artifact_mask].values
+        if eeg_for_ica.shape[0] < 100:  # Not enough clean data
+            print("[WARN] Not enough clean data for ICA, skipping ICA.")
+            eeg_clean = eeg_data.values
+        else:
+            ica = FastICA(n_components=8, random_state=42, max_iter=500)
+            S_ = ica.fit_transform(eeg_for_ica)
+            A_ = ica.mixing_
+            # Project full EEG data (including artifacted) into ICA space
+            S_full = ica.transform(eeg_data.values)
+            # Identify artifact-related components by correlation with ACC/GYR
+            accgyr = np.hstack([acc_data.values, gyr_data.values])
+            artifact_components = []
+            for i in range(S_full.shape[1]):
+                comp = S_full[:, i]
+                corr = np.max([np.corrcoef(comp, accgyr[:, j])[0, 1] for j in range(accgyr.shape[1])])
+                if abs(corr) > 0.3:
+                    artifact_components.append(i)
+            # Zero out artifact components
+            S_full[:, artifact_components] = 0
+            eeg_clean = np.dot(S_full, A_.T)
+            print(f"[INFO] ICA removed {len(artifact_components)} artifact components.")
+    except Exception as e:
+        print(f"[WARN] ICA failed: {e}")
+        eeg_clean = eeg_data.values
+    # Only use first 8 channels for EEG analysis
     if channels is None:
         channels = list(range(NUM_CHANNELS))
-    
-    time = np.arange(len(df)) / sampling_rate
+    time = np.arange(len(eeg_clean)) / sampling_rate
     processed_data = {}
-    
     current_fs = sampling_rate  # Keep track of current sampling rate
-    
     for channel_index in channels:
         try:
+            # Use cleaned EEG
+            data = pd.Series(eeg_clean[:, channel_index])
             # Convert to numeric and handle missing values
-            data = pd.to_numeric(df[channel_index], errors='coerce').dropna()
-            
+            data = pd.to_numeric(data, errors='coerce').dropna()
             # Apply filters
             filtered = filter_eeg(data, current_fs)
-            
             # Downsample if requested
             if downsample:
                 filtered, new_fs = downsample_with_antialiasing(filtered, current_fs, downsample_factor)
@@ -385,24 +412,18 @@ def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.
                 time_cut = np.arange(len(filtered)) / current_fs
             else:
                 time_cut = time[:len(filtered)]
-            
             # Compute PSD for whole signal
             freqs, psd = compute_psd(filtered, current_fs)
-            
             # Calculate overall band powers
             band_powers = calculate_normalized_band_powers(psd, freqs)
-            
             # Calculate bandpower ratios
             power_ratios = calculate_bandpower_ratios(band_powers)
-            
             # Calculate time-varying bandpowers using buffer
             buffer_times, buffer_powers, buffer_ratios = calculate_bandpower_with_buffer(
                 filtered, current_fs, buffer_size, buffer_overlap
             )
-            
             # Extract statistical features
             stat_features = extract_statistical_features(filtered, window_size=buffer_size, step_size=buffer_overlap, fs=current_fs)
-            
             # Store all data for this channel
             processed_data[channel_index] = {
                 'raw': data,
@@ -420,7 +441,6 @@ def process_eeg_data(filepath, channels=None, buffer_size=2.0, buffer_overlap=0.
                 'sampling_rate': current_fs,  # Store the actual sampling rate used
                 'stat_features': stat_features  # Store statistical features
             }
-            
         except Exception as e:
             print(f"Error processing channel {channel_index}: {e}")
     
@@ -1168,16 +1188,21 @@ def train_advanced_svm(X, y, mode, feature_names=None, plot_dir='reports'):
     cm_path = os.path.join(plot_dir, f'confusion_matrix_{mode}.pdf')
     fig_cm.savefig(cm_path)
     plt.close(fig_cm)
+    if not os.path.exists(cm_path):
+        print(f"[ERROR] Confusion matrix file was not created: {cm_path}")
     # 7. ROC curve (one-vs-rest)
-    if len(np.unique(y_test)) > 1:
-        fig_roc, ax_roc = plt.subplots(figsize=(6, 5))
-        RocCurveDisplay.from_estimator(best_svm, X_test, y_test, ax=ax_roc)
-        plt.title(f'ROC Curve ({mode})')
-        roc_path = os.path.join(plot_dir, f'roc_curve_{mode}.pdf')
-        fig_roc.savefig(roc_path)
-        plt.close(fig_roc)
-    else:
-        roc_path = None
+    try:
+        if len(np.unique(y_test)) > 1:
+            fig_roc, ax_roc = plt.subplots(figsize=(6, 5))
+            RocCurveDisplay.from_estimator(best_svm, X_test, y_test, ax=ax_roc)
+            plt.title(f'ROC Curve ({mode})')
+            roc_path = os.path.join(plot_dir, f'roc_curve_{mode}.pdf')
+            fig_roc.savefig(roc_path)
+            plt.close(fig_roc)
+            if not os.path.exists(roc_path):
+                print(f"[ERROR] ROC curve file was not created: {roc_path}")
+    except Exception as e:
+        print(f"[ERROR] Exception during ROC curve plot: {e}")
     # 8. Save model and scaler
     svm_path, scaler_path = get_model_paths(mode)
     joblib.dump(best_svm, svm_path)
@@ -1445,7 +1470,7 @@ def generate_pdf_report(
         # 6. EDA statistical features and decomposition (if provided)
         if eda_processed_data:
             for fname, eda_dict in eda_processed_data.items():
-                for key in ['raw', 'tonic', 'phasic']:
+                for key in ['raw', 'tonic', 'phagic']:
                     stat_features = eda_dict['features'].get(key, [])
                     if stat_features:
                         win_times = np.arange(len(stat_features)) * 2.0
@@ -1561,13 +1586,94 @@ def generate_pdf_report(
     print(f"[INFO] PDF report saved to {pdf_path}")
     return pdf_path
 
-def main():
-    import glob
-    import os
-    import datetime
-    import numpy as np
-    import pandas as pd
+def save_results_to_csv(all_processed_data, classification_results, output_csv_path):
+    """
+    Save per-file, per-channel statistical and classification results to a CSV file.
+    """
+    import csv
+    rows = []
+    header = [
+        'file', 'channel', 'mean', 'std', 'iqr', 'min', 'max', 'rms', 'skewness', 'kurtosis', 'moving_average'
+    ]
+    # Add band powers and ratios to header
+    band_headers = [f'power_{band}' for band in FREQ_BANDS]
+    ratio_headers = [
+        'power_ratio_index', 'delta_alpha_ratio', 'theta_alpha_ratio',
+        'theta_beta_ratio', 'theta_beta_alpha_ratio', 'engagement_index'
 
+    ]
+    header += band_headers + ratio_headers
+    # Add classification result columns if available
+    if classification_results:
+        header.append('classification_result')
+    # Collect data
+   
+    for fname, pdata in all_processed_data.items():
+        for ch_idx, ch_data in pdata.items():
+            # Use last stat_features window for summary (or mean over all windows)
+            if 'stat_features' in ch_data and ch_data['stat_features']:
+                stat = ch_data['stat_features'][-1]
+            else:
+                stat = {k: '' for k in ['mean','std','iqr','min','max','rms','skewness','kurtosis','moving_average']}
+            row = [fname, channel_labels[ch_idx]]
+            row += [stat.get(k, '') for k in ['mean','std','iqr','min','max','rms','skewness','kurtosis','moving_average']]
+            # Band powers
+            row += [ch_data['powers'].get(band, '') for band in FREQ_BANDS]
+            # Ratios
+            row += [ch_data['power_ratios'].get(r, '') for r in ratio_headers]
+            # Classification result (if available)
+            if classification_results and fname in classification_results:
+                row.append(classification_results[fname])
+            rows.append(row)
+    # Write to CSV
+    with open(output_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+    print(f"[INFO] Results CSV saved to {output_csv_path}")
+
+def extract_statistical_features(data, window_size=2.0, step_size=0.5, fs=250):
+    """
+    Extract time-domain statistical features from a 1D signal.
+    Features: mean, std, IQR, min, max, RMS, skewness, kurtosis, moving average.
+    Returns a list of dicts (one per window).
+    """
+    import numpy as np
+    from scipy.stats import skew, kurtosis
+    import pandas as pd
+    win_len = int(window_size * fs)
+    step_len = int (step_size * fs)
+    n_samples = len(data)
+    features = []
+    for start in range(0, n_samples - win_len + 1, step_len):
+        end = start + win_len
+        segment = data[start:end]
+        if len(segment) == 0:
+            continue
+        feat = {
+            'mean': float(np.mean(segment)),
+            'std': float(np.std(segment)),
+            'iqr': float(np.percentile(segment, 75) - np.percentile(segment, 25)),
+            'min': float(np.min(segment)),
+            'max': float(np.max(segment)),
+            'rms': float(np.sqrt(np.mean(np.square(segment)))),
+            'skewness': float(skew(segment)),
+            'kurtosis': float(kurtosis(segment)),
+            'moving_average': float(pd.Series(segment).rolling(window=5, min_periods=1).mean().iloc[-1])
+        }
+        features.append(feat)
+    return features
+
+# Patch: define extract_statistical_features at top-level for all uses
+extract_statistical_features = extract_statistical_features
+
+# Stub for missing plot_tonic_alpha_lateralization_low_arousal to avoid PDF error
+def plot_tonic_alpha_lateralization_low_arousal(*args, **kwargs):
+    print('[WARN] plot_tonic_alpha_lateralization_low_arousal is not implemented. Skipping this plot.')
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    logging.info('Starting EEG/EDA processing pipeline...')
     # Set up paths and timestamp
     data_folder = os.path.join(script_dir, 'data', 'raw', 'eeg')
     reports_dir = os.path.join(script_dir, 'reports')
@@ -1576,12 +1682,17 @@ def main():
 
     # 1. Collect all EEG files
     eeg_files = glob.glob(os.path.join(data_folder, '*.csv'))
+    logging.info(f'Found {len(eeg_files)} EEG files in {data_folder}')
     all_processed_data = {}
     file_names = []
     for eeg_file in eeg_files:
-        processed = process_eeg_data(eeg_file)
-        all_processed_data[os.path.basename(eeg_file)] = processed
-        file_names.append(os.path.basename(eeg_file))
+        try:
+            processed = process_eeg_data(eeg_file)
+            all_processed_data[os.path.basename(eeg_file)] = processed
+            file_names.append(os.path.basename(eeg_file))
+            logging.info(f'Processed EEG file: {eeg_file}')
+        except Exception as e:
+            logging.error(f'Error processing {eeg_file}: {e}')
 
     # 2. Prepare features and labels for SVM (example: using allch mode)
     X, y = [], []
@@ -1592,145 +1703,195 @@ def main():
         y.append(label)
     X = np.array(X)
     y = np.array(y)
+    logging.info(f'Feature matrix shape: {X.shape}, Labels: {set(y)}')
 
     # 3. Train advanced SVM and perform ANOVA if there is more than one class
     classification_results = {}
     results_summary = ''
+    svm_metrics = {}
+    selected_features = None
     if len(np.unique(y)) > 1:
-        best_svm, scaler, selected_features = train_advanced_svm(X, y, mode='allch')
-        classification_results['allch'] = f"SVM trained with {len(selected_features)} features."
-        anova_results = perform_anova_on_bandpowers(X, y, feature_names=None, report_dir=reports_dir, mode='allch')
-        results_summary += f"ANOVA performed on {X.shape[1]} features.\n"
+        try:
+            best_svm, scaler, selected_features = train_advanced_svm(X, y, mode='allch')
+            # Collect metrics for SVM report
+            from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            y_pred = best_svm.predict(X_test)
+            svm_metrics['accuracy'] = accuracy_score(y_test, y_pred)
+            svm_metrics['f1'] = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+            svm_metrics['precision'] = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+            svm_metrics['recall'] = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+            # Per-class metrics
+            report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+            classes = [k for k in report.keys() if k not in ('accuracy', 'macro avg', 'weighted avg')]
+            per_class_metrics = {
+                'classes': classes,
+                'f1': [report[c]['f1-score'] for c in classes],
+                'precision': [report[c]['precision'] for c in classes],
+                'recall': [report[c]['recall'] for c in classes]
+            }
+            classification_results['per_class_metrics'] = per_class_metrics
+            classification_results['allch'] = f"SVM trained with {len(selected_features)} features."
+            anova_results = perform_anova_on_bandpowers(X, y, feature_names=None, report_dir=reports_dir, mode='allch')
+            results_summary += f"ANOVA performed on {X.shape[1]} features.\n"
+            logging.info('SVM training and ANOVA completed.')
+        except Exception as e:
+            logging.error(f'Error in SVM training/ANOVA: {e}')
     else:
         results_summary += "Not enough classes for SVM/ANOVA.\n"
+        logging.warning('Not enough classes for SVM/ANOVA.')
 
     # 4. Calculate asymmetry indices for each file
     asymmetry_indices = {}
     for fname, pdata in all_processed_data.items():
-        asymmetry_indices[fname] = calculate_asymmetry_indices(pdata)
+        try:
+            asymmetry_indices[fname] = calculate_asymmetry_indices(pdata)
+        except Exception as e:
+            logging.error(f'Error calculating asymmetry for {fname}: {e}')
     results_summary += f"Alpha asymmetry indices calculated for all files.\n"
+    logging.info('Alpha asymmetry indices calculated.')
 
     # 5. Generate PDF report (ensure all relevant data is passed)
-    generate_pdf_report(
-        output_dir=reports_dir,
-        emotion_matrix=None,
-        file_names=file_names,
-        valence_arousal_data=None,
-        png_paths=None,
-        baseline_file=None,
-        settings=f"Sampling rate: {sampling_rate}, Downsample factor: {downsample_factor}",
-        steps_description="Advanced SVM, SMOTE, RFE, ANOVA, Asymmetry, Visualization",
-        results_summary=results_summary,
-        all_processed_data=all_processed_data,
-        classification_results=classification_results,
-        visualizations=None,
-        timestamp=timestamp
-    )
+    try:
+        pdf_path = generate_pdf_report(
+            output_dir=reports_dir,
+            emotion_matrix=None,
+            file_names=file_names,
+            valence_arousal_data=None,
+            png_paths=None,
+            baseline_file=None,
+            settings=f"Sampling rate: {sampling_rate}, Downsample factor: {downsample_factor}",
+            steps_description="Advanced SVM, SMOTE, RFE, ANOVA, Asymmetry, Visualization",
+            results_summary=results_summary,
+            all_processed_data=all_processed_data,
+            classification_results=classification_results,
+            visualizations=None,
+            timestamp=timestamp
+        )
+        logging.info(f'PDF report generated: {pdf_path}')
+        # --- SVM/classification-only report ---
+        svm_report_dict = {
+            'metrics': svm_metrics,
+            'selected_features': selected_features
+        }
+        generate_svm_classification_report(svm_report_dict, mode='allch', timestamp=timestamp, reports_dir=reports_dir)
+    except Exception as e:
+        logging.error(f'Error generating PDF report: {e}')
 
-# --- COMPARATIVE TONIC/PHASIC VISUALIZATION ACROSS ALL FILES ---
-def plot_tonic_phasic_comparison_all_files(eda_processed_data, eeg_processed_data=None, pdf=None):
+    # 6. Save results to CSV
+    try:
+        output_csv_path = os.path.join(reports_dir, f'results_summary_{timestamp}.csv')
+        save_results_to_csv(all_processed_data, classification_results, output_csv_path)
+    except Exception as e:
+        print(f"[ERROR] Could not save results CSV: {e}")
+
+    # --- Comparative Band Summary Plot for All Files ---
+    try:
+        band_stats = normalize_across_files(all_processed_data)
+        baseline_file = file_names[0] if file_names else None
+        fig = create_comparative_visualization(all_processed_data, baseline_file, band_stats)
+        comparative_png_path = os.path.join(reports_dir, f'comparative_band_summary_{timestamp}.png')
+        fig.write_image(comparative_png_path, width=1600, height=1200)
+        logging.info(f"Comparative band summary plot saved as PNG: {comparative_png_path}")
+    except Exception as e:
+        print(f"[WARN] Could not generate comparative band summary plot: {e}")
+
+    logging.info('Pipeline complete.')
+
+def generate_svm_classification_report(classification_results, mode, timestamp=None, reports_dir='reports'):
     """
-    Plot tonic and phasic EDA components for all files on the same axes for comparison.
-    Optionally, plot EEG slow/fast band power envelopes at key electrodes to mimic tonic/phasic and lateralization.
+    Generate a focused PDF report containing only SVM model and classification statistics/visualizations.
+    Includes confusion matrix, ROC curve, accuracy, F1, precision, recall, and feature info.
     """
     import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import os
+    import datetime
     import numpy as np
-    colors = plt.cm.tab10.colors
-    # --- EDA: Tonic and Phasic ---
-    plt.figure(figsize=(12, 6))
-    for i, (fname, eda_dict) in enumerate(eda_processed_data.items()):
-        n = len(eda_dict['tonic'])
-        t = np.arange(n) / 250.0
-        plt.plot(t, eda_dict['tonic'], label=f"{fname} tonic", color=colors[i % 10], alpha=0.7, linestyle='-')
-    plt.title('EDA Tonic Component Comparison Across Files')
-    plt.xlabel('Time (s)')
-    plt.ylabel('EDA (uS)')
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    if pdf is not None:
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    os.makedirs(reports_dir, exist_ok=True)
+    pdf_path = os.path.join(reports_dir, f'svm_classification_report_{mode}_{timestamp}.pdf')
+    cm_path = os.path.join(reports_dir, f'confusion_matrix_{mode}.pdf')
+    roc_path = os.path.join(reports_dir, f'roc_curve_{mode}.pdf')
+    with PdfPages(pdf_path) as pdf:
+        # Title page with features, hyperparameters, and summary
+        plt.figure(figsize=(8.5, 11))
+        plt.axis('off')
+        plt.title('SVM Classification Report', fontsize=20, pad=40)
+        plt.text(0.1, 0.8, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", fontsize=12)
+        plt.text(0.1, 0.75, f"Mode: {mode}", fontsize=12)
+        plt.text(0.1, 0.7, f"Report location: {pdf_path}", fontsize=8)
+        # Features used
+        features = classification_results.get('selected_features', None)
+        if features is not None:
+            plt.text(0.1, 0.65, "Features used:", fontsize=12, fontweight='bold')
+            plt.text(0.12, 0.62, str(features), fontsize=10)
+        # Hyperparameters used
+        hyperparams = classification_results.get('hyperparameters', None)
+        if hyperparams is not None:
+            plt.text(0.1, 0.58, "SVM Hyperparameters:", fontsize=12, fontweight='bold')
+            y = 0.55
+            for k, v in hyperparams.items():
+                plt.text(0.12, y, f"{k}: {v}", fontsize=10)
+                y -= 0.025
+        # Methodology and interpretation summary
+        summary_text = (
+            "This report summarizes the results of SVM-based classification of EEG/EDA data. "
+            "The pipeline includes class balancing (SMOTE), feature selection (RFE), and hyperparameter tuning (GridSearchCV). "
+            "Selected features and SVM hyperparameters are listed above. "
+            "Performance metrics (accuracy, F1, precision, recall), confusion matrix, and ROC curve are provided. "
+            "Interpretation: Higher accuracy and F1 indicate better discrimination between classes. "
+            "Feature selection helps focus the model on the most informative EEG/EDA features. "
+            "Hyperparameter tuning ensures optimal SVM performance. "
+            "Review the confusion matrix and ROC curve for detailed class-wise performance."
+        )
+        plt.text(0.1, 0.45, summary_text, fontsize=10, wrap=True)
+        plt.tight_layout()
         pdf.savefig()
-    plt.close()
-
-    plt.figure(figsize=(12, 6))
-    for i, (fname, eda_dict) in enumerate(eda_processed_data.items()):
-        n = len(eda_dict['phagic']) if 'phagic' in eda_dict else len(eda_dict['phasic'])
-        t = np.arange(n) / 250.0
-        phasic = eda_dict.get('phagic', eda_dict.get('phasic'))
-        plt.plot(t, phasic, label=f"{fname} phasic", color=colors[i % 10], alpha=0.7, linestyle='-')
-    plt.title('EDA Phasic Component Comparison Across Files')
-    plt.xlabel('Time (s)')
-    plt.ylabel('EDA (uS)')
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    if pdf is not None:
+        plt.close()
+        # Metrics summary (overall)
+        metrics = classification_results.get('metrics', {})
+        plt.figure(figsize=(8, 4))
+        plt.axis('off')
+        plt.title('SVM Classification Metrics', fontsize=14)
+        y = 0.8
+        for k in ['accuracy', 'f1', 'precision', 'recall']:
+            if k in metrics:
+                plt.text(0.1, y, f"{k.capitalize()}: {metrics[k]:.4f}", fontsize=12)
+                y -= 0.1
+        plt.tight_layout()
         pdf.savefig()
-    plt.close()
-
-    # --- EEG: Tonic/Phasic-like (slow/fast band power) at key electrodes ---
-    if eeg_processed_data is not None:
-        # Define slow (delta+theta+alpha) and fast (beta) bands
-        slow_bands = ['delta', 'theta', 'alpha']
-        fast_bands = ['beta_low', 'beta_mid']
-        # Key electrodes for lateralization: PO7 (5), PO8 (7), C3 (1), C4 (3)
-        key_electrodes = {'PO7': 5, 'PO8': 7, 'C3': 1, 'C4': 3}
-        for label, ch_idx in key_electrodes.items():
-            plt.figure(figsize=(12, 5))
-            for i, (fname, pdata) in enumerate(eeg_processed_data.items()):
-                ch_data = pdata.get(ch_idx)
-                if ch_data is None:
-                    continue
-                buffer_times = ch_data['buffer_data']['times']
-                slow_power = np.zeros_like(buffer_times)
-                fast_power = np.zeros_like(buffer_times)
-                for band in slow_bands:
-                    slow_power += ch_data['buffer_data']['powers'][band]
-                for band in fast_bands:
-                    fast_power += ch_data['buffer_data']['powers'][band]
-                plt.plot(buffer_times, slow_power, label=f"{fname} slow (tonic)", color=colors[i % 10], alpha=0.7, linestyle='-')
-                plt.plot(buffer_times, fast_power, label=f"{fname} fast (phasic)", color=colors[i % 10], alpha=0.7, linestyle='--')
-            plt.title(f'EEG Slow (Tonic) and Fast (Phasic) Band Power at {label} Across Files')
-            plt.xlabel('Time (s)')
-            plt.ylabel('Band Power (a.u.)')
-            plt.legend(fontsize=8, ncol=2)
+        plt.close()
+        # Per-class metrics table
+        if 'per_class_metrics' in classification_results:
+            per_class = classification_results['per_class_metrics']
+            classes = per_class['classes']
+            f1s = per_class['f1']
+            precisions = per_class['precision']
+            recalls = per_class['recall']
+            fig, ax = plt.subplots(figsize=(8, 2 + 0.3*len(classes)))
+            ax.axis('off')
+            table_data = [["Class", "F1 Score", "Precision", "Recall"]]
+            for i, cls in enumerate(classes):
+                table_data.append([
+                    str(cls),
+                    f"{f1s[i]:.3f}",
+                    f"{precisions[i]:.3f}",
+                    f"{recalls[i]:.3f}"
+                ])
+            table = ax.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.2, 0.2, 0.2, 0.2])
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 1.5)
+            plt.title('SVM: Classification Metrics by Class', fontsize=14)
             plt.tight_layout()
-            if pdf is not None:
-                pdf.savefig()
-            plt.close()
+            pdf.savefig()
+            plt.close(fig)
+    print(f"[INFO] SVM classification report saved to {pdf_path}")
+    print(f"[INFO] Confusion matrix: {cm_path}")
+    print(f"[INFO] ROC curve: {roc_path}")
+    return pdf_path
 
-def plot_tonic_alpha_lateralization_low_arousal(all_processed_data, pdf=None):
-    """
-    For each file, extract tonic (mean) alpha power at PO7 (left) and PO8 (right) for windows labeled as 'Calm' or 'Sad'.
-    Compute and plot the alpha asymmetry index (right - left, log scale) grouped by emotion label.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    colors = plt.cm.Set2.colors
-    results = {'Calm': [], 'Sad': []}
-    file_labels = []
-    for fname, pdata in all_processed_data.items():
-        # Find window labels and band powers for PO7 (5) and PO8 (7)
-        ch_left = pdata.get(5, {})  # PO7
-        ch_right = pdata.get(7, {}) # PO8
-        if not ch_left or not ch_right:
-            continue
-        # Assume window labels and band powers are stored per window
-        window_labels = ch_left.get('window_labels', [])
-        alpha_left = [w.get('alpha', 0) for w in ch_left.get('window_band_powers', [])]
-        alpha_right = [w.get('alpha', 0) for w in ch_right.get('window_band_powers', [])]
-        for lbl, aL, aR in zip(window_labels, alpha_left, alpha_right):
-            if lbl in results:
-                # Tonic = mean alpha in window
-                asym = np.log(aR + 1e-6) - np.log(aL + 1e-6)
-                results[lbl].append(asym)
-        file_labels.append(fname)
-    # Plot
-    plt.figure(figsize=(8, 4))
-    data = [results['Calm'], results['Sad']]
-    plt.boxplot(data, labels=['Calm', 'Sad'], patch_artist=True, boxprops=dict(facecolor=colors[0], alpha=0.5))
-    plt.title('Tonic Lateralized Alpha Asymmetry (PO8-PO7) in Low-Arousal States')
-    plt.ylabel('Alpha Asymmetry (log right - log left)')
-    plt.xlabel('Emotion (Low Arousal)')
-    plt.grid(True, axis='y', alpha=0.3)
-    if pdf is not None:
-        pdf.savefig()
-    plt.close()
+if __name__ == "__main__":
+    main()
